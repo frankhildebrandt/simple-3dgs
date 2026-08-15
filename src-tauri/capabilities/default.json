@@ -6,6 +6,8 @@
   "permissions": [
     "core:default",
     "core:window:allow-set-fullscreen",
+    "core:window:allow-set-cursor-grab",
+    "core:window:allow-set-cursor-visible",
     "opener:default",
     "dialog:default",
     "shell:allow-open",

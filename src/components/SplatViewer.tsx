@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as THREE from "three";
 import { SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+import { LookCapture, isLookCaptureClick, isLookReleaseKey } from "../lookCapture";
+import { applyPointerLook } from "../pointerLook";
 import type { CaptureMode } from "../types";
 import { viewerProfile } from "../viewerProfile";
 
@@ -170,14 +173,31 @@ export function SplatViewer({
       KeyE: new THREE.Vector3(0, -1, 0),
     };
     controls.fpsMovement.moveSpeed = 2;
+    controls.pointerControls.enable = false;
 
     worldRef.current = { scene, camera, renderer, spark, controls, splat: null, framed: false, view: null };
     setReady(true);
 
-    const onPointerDown = () => {
+    const look = new LookCapture(getCurrentWindow());
+    const onPointerDown = (event: PointerEvent) => {
       renderer.domElement.focus();
+      if (!isLookCaptureClick(event)) {
+        return;
+      }
+      void look.enter();
+    };
+    const onMouseMove = (event: MouseEvent) => {
+      if (!look.captured) {
+        return;
+      }
+      applyPointerLook(camera, event.movementX, event.movementY);
     };
     const onKeyDown = (event: KeyboardEvent) => {
+      if (isLookReleaseKey(event) && look.captured) {
+        event.preventDefault();
+        void look.exit();
+        return;
+      }
       if (event.code !== "Space" || event.repeat || event.metaKey || event.ctrlKey || event.altKey) {
         return;
       }
@@ -196,8 +216,13 @@ export function SplatViewer({
       event.preventDefault();
       frameSplat(world.camera, world.controls, mesh, modeRef.current, world.view);
     };
+    const onBlur = () => {
+      void look.exit();
+    };
     host.addEventListener("pointerdown", onPointerDown);
     host.addEventListener("keydown", onKeyDown);
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("blur", onBlur);
 
     let frame = 0;
     const animate = () => {
@@ -223,6 +248,9 @@ export function SplatViewer({
       observer.disconnect();
       host.removeEventListener("pointerdown", onPointerDown);
       host.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("blur", onBlur);
+      void look.exit();
       controls.fpsMovement.enable = false;
       controls.pointerControls.enable = false;
       worldRef.current?.splat?.removeFromParent();
@@ -294,8 +322,8 @@ export function SplatViewer({
   }, [captureMode, ready]);
 
   const hint = live
-    ? "Live preview — WASD fly · Q up · E down · Space start · Shift faster"
-    : "WASD fly · Q up · E down · Space start · Drag to look · Right-drag slide · Shift faster";
+    ? "Live preview — Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster"
+    : "Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster";
 
   return (
     <div className="viewer" ref={hostRef}>
