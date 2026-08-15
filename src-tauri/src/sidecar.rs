@@ -11,11 +11,19 @@ use std::time::Duration;
 use crate::error::PipelineError;
 use crate::settings::CaptureMode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchMode {
+    None,
+    Ply,
+    Image,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub sidecar: &'static str,
     pub args: Vec<String>,
     pub watch_dir: Option<PathBuf>,
+    pub watch_mode: WatchMode,
     pub capture_mode: CaptureMode,
 }
 
@@ -25,12 +33,20 @@ impl CommandSpec {
             sidecar,
             args,
             watch_dir: None,
+            watch_mode: WatchMode::None,
             capture_mode: CaptureMode::Object,
         }
     }
 
     pub fn watching(mut self, dir: impl Into<PathBuf>) -> Self {
         self.watch_dir = Some(dir.into());
+        self.watch_mode = WatchMode::Ply;
+        self
+    }
+
+    pub fn watching_images(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.watch_dir = Some(dir.into());
+        self.watch_mode = WatchMode::Image;
         self
     }
 
@@ -162,6 +178,8 @@ impl SidecarRunner for ProcessRunner {
                 PipelineError::message(format!("failed to start {}: {err}", spec.sidecar))
             })?;
 
+        let mut caffeinate = keep_awake(child.id());
+
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -193,6 +211,7 @@ impl SidecarRunner for ProcessRunner {
             self.cancel.check().map_err(|err| {
                 let _ = child.kill();
                 let _ = child.wait();
+                stop_caffeinate(&mut caffeinate);
                 err
             })?;
             match child.try_wait()? {
@@ -213,6 +232,7 @@ impl SidecarRunner for ProcessRunner {
             brush_panicked |= take_line(spec, &mut tail, log, line);
         }
         emit_preview(spec, &mut last_preview, preview);
+        stop_caffeinate(&mut caffeinate);
 
         sidecar_result(
             spec,
@@ -275,7 +295,12 @@ fn emit_preview(spec: &CommandSpec, last: &mut Option<PathBuf>, preview: &mut dy
     let Some(dir) = spec.watch_dir.as_ref() else {
         return;
     };
-    let Some(path) = crate::project::newest_ready_ply(dir) else {
+    let path = match spec.watch_mode {
+        WatchMode::Ply => crate::project::newest_ready_ply(dir),
+        WatchMode::Image => crate::project::newest_ready_image(dir),
+        WatchMode::None => None,
+    };
+    let Some(path) = path else {
         return;
     };
     if last.as_ref() == Some(&path) {
@@ -283,6 +308,24 @@ fn emit_preview(spec: &CommandSpec, last: &mut Option<PathBuf>, preview: &mut dy
     }
     *last = Some(path.clone());
     preview(&path);
+}
+
+/// Prevents idle sleep while a sidecar PID is alive. No-op when `caffeinate` is missing.
+fn keep_awake(pid: u32) -> Option<std::process::Child> {
+    Command::new("caffeinate")
+        .args(["-dimsu", "-w", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+fn stop_caffeinate(child: &mut Option<std::process::Child>) {
+    if let Some(mut proc) = child.take() {
+        let _ = proc.kill();
+        let _ = proc.wait();
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -360,6 +403,13 @@ impl SidecarRunner for FakeRunner {
         if spec.sidecar == "brush" {
             if let Some(path) = spec.watch_dir.as_ref().and_then(|dir| {
                 crate::project::newest_ready_ply(dir).or_else(|| crate::project::newest_ply(dir))
+            }) {
+                preview(&path);
+            }
+        }
+        if spec.watch_mode == WatchMode::Image {
+            if let Some(path) = spec.watch_dir.as_ref().and_then(|dir| {
+                crate::project::newest_image(dir)
             }) {
                 preview(&path);
             }

@@ -15,6 +15,7 @@ pub struct TrainSnapshot {
     pub train_views: Option<u32>,
     pub eval_views: Option<u32>,
     pub elapsed_secs: Option<u64>,
+    pub eta_secs: Option<u64>,
 }
 
 impl TrainSnapshot {
@@ -28,6 +29,7 @@ impl TrainSnapshot {
             train_views: None,
             eval_views: None,
             elapsed_secs: None,
+            eta_secs: None,
         }
     }
 
@@ -62,7 +64,16 @@ impl TrainSnapshot {
             return false;
         }
         self.iter = Some(iter);
+        self.refresh_eta();
         true
+    }
+
+    pub fn refresh_eta(&mut self) {
+        let (Some(iter), Some(elapsed)) = (self.iter, self.elapsed_secs) else {
+            self.eta_secs = None;
+            return;
+        };
+        self.eta_secs = crate::duration::eta_secs(elapsed, iter, self.total);
     }
 
     pub fn percent(&self) -> u8 {
@@ -94,19 +105,12 @@ impl TrainSnapshot {
             parts.push(format!("SSIM {ssim:.3}"));
         }
         if let Some(secs) = self.elapsed_secs {
-            parts.push(format_elapsed(secs));
+            parts.push(crate::duration::format_duration(secs));
+        }
+        if let Some(secs) = self.eta_secs {
+            parts.push(format!("ETA {}", crate::duration::format_duration(secs)));
         }
         parts.join(" · ")
-    }
-}
-
-fn format_elapsed(secs: u64) -> String {
-    let minutes = secs / 60;
-    let seconds = secs % 60;
-    if minutes == 0 {
-        format!("{seconds}s")
-    } else {
-        format!("{minutes}m {seconds:02}s")
     }
 }
 

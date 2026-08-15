@@ -541,6 +541,29 @@ button.primary {
   color: var(--success);
 }
 
+.stages li {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.stage-pct {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+}
+
+.progress-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.progress-pct {
+  font-variant-numeric: tabular-nums;
+  min-width: 3.2rem;
+  text-align: right;
+}
+
 .progress-message {
   margin: 0;
 }
@@ -575,6 +598,88 @@ button.primary {
 progress {
   width: 100%;
   accent-color: var(--accent);
+}
+
+.progress-bar-row progress {
+  flex: 1;
+}
+
+.stage-preview {
+  display: flex;
+  flex-direction: column;
+}
+
+.frame-hero {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--ink);
+}
+
+.frame-hero img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.filmstrip {
+  display: flex;
+  gap: 0.35rem;
+  overflow-x: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0.5rem 0.7rem;
+  background: var(--panel);
+}
+
+.filmstrip button {
+  padding: 0;
+  border: 1px solid transparent;
+  background: none;
+  width: 72px;
+  height: 48px;
+}
+
+.filmstrip button.active {
+  border-color: var(--accent);
+}
+
+.filmstrip img {
+  width: 72px;
+  height: 48px;
+  object-fit: cover;
+  display: block;
+}
+
+.project-picker {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.85rem;
+  background: var(--sunken);
+}
+
+.project-select {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.55rem;
+  color: var(--faint);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.project-select select {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.9rem;
+  background: var(--ink);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.5rem;
 }
 
 .logs {

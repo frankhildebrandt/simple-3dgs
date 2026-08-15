@@ -18,6 +18,25 @@ pub struct ViewPose {
     pub quaternion: [f64; 4],
 }
 
+/// One registered camera plus a subsampled sparse cloud for the large preview.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SparseCamera {
+    pub name: String,
+    pub position: [f64; 3],
+    pub quaternion: [f64; 4],
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SparsePreview {
+    pub cameras: Vec<SparseCamera>,
+    pub points: Vec<[f32; 3]>,
+    pub colors: Vec<[u8; 3]>,
+}
+
+const MAX_SPARSE_POINTS: usize = 50_000;
+
 /// Writes `output/view.json` from `colmap/sparse/0/images.bin`. Missing or fake bins are skipped.
 pub fn write_output_view(layout: &ProjectLayout) {
     let Some(pose) = first_view_pose(&layout.sparse_model_dir().join("images.bin")) else {
@@ -41,13 +60,87 @@ pub fn read_view_json(path: &Path) -> Option<ViewPose> {
 
 /// Earliest image name among registered cameras, converted into Spark space.
 pub fn first_view_pose(images_bin: &Path) -> Option<ViewPose> {
-    let bytes = fs::read(images_bin).ok()?;
-    let mut images = parse_images_binary(&bytes).ok()?;
+    let mut images = registered_images(images_bin)?;
     if images.is_empty() {
         return None;
     }
     images.sort_by(|a, b| a.name.cmp(&b.name));
     Some(colmap_to_spark(&images[0]))
+}
+
+/// Registered cameras in Spark space, plus a capped XYZ/RGB point cloud.
+pub fn sparse_preview(model_dir: &Path) -> Option<SparsePreview> {
+    let images = registered_images(&model_dir.join("images.bin")).unwrap_or_default();
+    if images.is_empty() {
+        return None;
+    }
+    let cameras = images
+        .iter()
+        .map(|image| {
+            let pose = colmap_to_spark(image);
+            SparseCamera {
+                name: image.name.clone(),
+                position: pose.position,
+                quaternion: pose.quaternion,
+            }
+        })
+        .collect();
+    let (points, colors) = parse_points3d(&model_dir.join("points3D.bin")).unwrap_or_default();
+    Some(SparsePreview {
+        cameras,
+        points,
+        colors,
+    })
+}
+
+fn registered_images(images_bin: &Path) -> Option<Vec<ColmapImage>> {
+    let bytes = fs::read(images_bin).ok()?;
+    parse_images_binary(&bytes).ok()
+}
+
+/// Count of registered images; `None` if the bin is missing or fake.
+pub fn registered_count(images_bin: &Path) -> Option<u32> {
+    registered_images(images_bin).map(|images| images.len() as u32)
+}
+
+/// Count of 3D points; `None` if the bin is missing or fake.
+pub fn points3d_count(points_bin: &Path) -> Option<u32> {
+    let bytes = fs::read(points_bin).ok()?;
+    let mut cur = Cursor::new(bytes.as_slice());
+    read_u64(&mut cur).ok().map(|n| n as u32)
+}
+
+/// Builds cameras.json from the sparse model plus any frames COLMAP did not register.
+pub fn camera_manifest(
+    model_dir: &Path,
+    frame_names: &[String],
+) -> crate::manifest::CameraManifest {
+    let preview = sparse_preview(model_dir).unwrap_or_default();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cameras = Vec::new();
+    for camera in preview.cameras {
+        seen.insert(camera.name.clone());
+        cameras.push(crate::manifest::CameraEntry {
+            name: camera.name,
+            position: camera.position,
+            quaternion: camera.quaternion,
+            registered: true,
+            included: true,
+        });
+    }
+    for name in frame_names {
+        if seen.contains(name) {
+            continue;
+        }
+        cameras.push(crate::manifest::CameraEntry {
+            name: name.clone(),
+            position: [0.0, 0.0, 0.0],
+            quaternion: [0.0, 0.0, 0.0, 1.0],
+            registered: false,
+            included: true,
+        });
+    }
+    crate::manifest::CameraManifest { cameras }
 }
 
 struct ColmapImage {
@@ -100,6 +193,52 @@ fn parse_images_binary(bytes: &[u8]) -> io::Result<Vec<ColmapImage>> {
         });
     }
     Ok(images)
+}
+
+fn parse_points3d(path: &Path) -> io::Result<(Vec<[f32; 3]>, Vec<[u8; 3]>)> {
+    let bytes = fs::read(path)?;
+    let mut cur = Cursor::new(bytes.as_slice());
+    let n = read_u64(&mut cur)?;
+    if n > 10_000_000 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "too many points"));
+    }
+    let stride = if n as usize > MAX_SPARSE_POINTS {
+        (n as usize / MAX_SPARSE_POINTS).max(1)
+    } else {
+        1
+    };
+    let mut points = Vec::new();
+    let mut colors = Vec::new();
+    for i in 0..n {
+        let _id = read_u64(&mut cur)?;
+        let x = read_f64(&mut cur)? as f32;
+        let y = read_f64(&mut cur)? as f32;
+        let z = read_f64(&mut cur)? as f32;
+        let mut rgb = [0u8; 3];
+        cur.read_exact(&mut rgb)?;
+        let _error = read_f64(&mut cur)?;
+        let track = read_u64(&mut cur)?;
+        let skip = track
+            .checked_mul(8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "track overflow"))?;
+        let pos = cur.position().saturating_add(skip);
+        if pos > bytes.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated track",
+            ));
+        }
+        cur.set_position(pos);
+        if (i as usize) % stride == 0 {
+            let spark = mulv(RX180, [f64::from(x), f64::from(y), f64::from(z)]);
+            points.push([spark[0] as f32, spark[1] as f32, spark[2] as f32]);
+            colors.push(rgb);
+        }
+        if points.len() >= MAX_SPARSE_POINTS {
+            break;
+        }
+    }
+    Ok((points, colors))
 }
 
 /// COLMAP cam-from-world → Spark camera, matching the splat's Rx(180).
@@ -352,5 +491,45 @@ mod tests {
         assert!((pose.position[0] + 1.0).abs() < 1e-9);
         assert!((pose.position[1] - 2.0).abs() < 1e-9);
         assert!((pose.position[2] - 3.0).abs() < 1e-9);
+    }
+
+    fn points_bin(points: &[([f64; 3], [u8; 3])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(points.len() as u64).to_le_bytes());
+        for (i, (xyz, rgb)) in points.iter().enumerate() {
+            buf.extend_from_slice(&(i as u64).to_le_bytes());
+            for v in xyz {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            buf.extend_from_slice(rgb);
+            buf.extend_from_slice(&0f64.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn sparse_preview_lists_cameras_and_points() {
+        let dir = tempdir().unwrap();
+        let model = dir.path();
+        fs::write(
+            model.join("images.bin"),
+            images_bin(&[(1, [1.0, 0.0, 0.0, 0.0], [1.0, 2.0, 3.0], "frame_00001.jpg")]),
+        )
+        .unwrap();
+        fs::write(
+            model.join("points3D.bin"),
+            points_bin(&[([0.0, 1.0, 2.0], [10, 20, 30])]),
+        )
+        .unwrap();
+        let preview = sparse_preview(model).unwrap();
+        assert_eq!(preview.cameras.len(), 1);
+        assert_eq!(preview.cameras[0].name, "frame_00001.jpg");
+        assert_eq!(preview.points.len(), 1);
+        assert_eq!(preview.colors[0], [10, 20, 30]);
+        let manifest = camera_manifest(model, &["frame_00001.jpg".into(), "frame_00002.jpg".into()]);
+        assert_eq!(manifest.cameras.len(), 2);
+        assert!(manifest.cameras[0].registered);
+        assert!(!manifest.cameras[1].registered);
     }
 }

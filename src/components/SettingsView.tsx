@@ -20,10 +20,10 @@ export function SettingsView({ config, onConfig }: Props) {
     }
   }
 
-  async function pickProjectDir() {
+  async function pickProjectsDir() {
     const selected = await open({ directory: true, multiple: false });
     if (typeof selected === "string" && config) {
-      await persist({ ...config, tempProject: false, projectDir: selected });
+      await persist({ ...config, tempProject: false, projectsDir: selected });
     }
   }
 
@@ -31,15 +31,7 @@ export function SettingsView({ config, onConfig }: Props) {
     if (!config) {
       return;
     }
-    if (tempProject) {
-      await persist({ ...config, tempProject: true });
-      return;
-    }
-    if (config.projectDir) {
-      await persist({ ...config, tempProject: false });
-      return;
-    }
-    await pickProjectDir();
+    await persist({ ...config, tempProject });
   }
 
   return (
@@ -67,8 +59,8 @@ export function SettingsView({ config, onConfig }: Props) {
           <legend>Project</legend>
           <label
             className="check"
-            title="Delete intermediate COLMAP and Brush files after a run"
-            data-hint="Delete intermediate COLMAP and Brush files after a run"
+            title="Delete intermediate COLMAP and Brush files after a successful archive"
+            data-hint="Delete intermediate COLMAP and Brush files after a successful archive"
           >
             <input
               type="checkbox"
@@ -78,21 +70,17 @@ export function SettingsView({ config, onConfig }: Props) {
             />
             Temporary project folder
           </label>
-          {config && !config.tempProject ? (
-            <>
-              <p className="dropzone-label">
-                {config.projectDir ? config.projectDir : "Choose a project folder"}
-              </p>
-              <button
-                type="button"
-                title="Keep frames, COLMAP, and checkpoints for debugging"
-                data-hint="Keep frames, COLMAP, and checkpoints for debugging"
-                onClick={() => void pickProjectDir()}
-              >
-                Choose project folder
-              </button>
-            </>
-          ) : null}
+          <p className="dropzone-label">
+            {config?.projectsDir ? config.projectsDir : "Named projects live next to the archive"}
+          </p>
+          <button
+            type="button"
+            title="Named projects are stored here so you can continue later"
+            data-hint="Named projects are stored here so you can continue later"
+            onClick={() => void pickProjectsDir()}
+          >
+            Choose projects folder
+          </button>
         </fieldset>
       </section>
     </div>

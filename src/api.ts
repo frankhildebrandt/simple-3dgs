@@ -1,5 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppConfig, ArchiveEntry, PipelineRequest, RunResult } from "./types";
+import type {
+  AppConfig,
+  ArchiveEntry,
+  PipelineRequest,
+  ProjectEntry,
+  ProjectFrame,
+  RunResult,
+  SparsePreview,
+} from "./types";
 
 export function startPipeline(request: PipelineRequest): Promise<RunResult> {
   return invoke<RunResult>("start_pipeline", { request });
@@ -69,4 +77,32 @@ export function dropArchivePly(id: string): Promise<ArchiveEntry> {
 /** Reads a local PLY or SPZ as a raw IPC body. */
 export function readSplatFile(path: string): Promise<unknown> {
   return invoke("read_splat_file", { path });
+}
+
+export function createProject(request: {
+  title?: string | null;
+  sourcePath: string;
+  sourceKind: string;
+  settings: PipelineRequest["settings"];
+  temp: boolean;
+  projectsDir?: string | null;
+  projectDir?: string | null;
+}): Promise<ProjectEntry> {
+  return invoke<ProjectEntry>("create_project", { request });
+}
+
+export function openProject(path: string): Promise<ProjectEntry> {
+  return invoke<ProjectEntry>("open_project", { path });
+}
+
+export function listProjects(projectsDir?: string | null): Promise<ProjectEntry[]> {
+  return invoke<ProjectEntry[]>("list_projects", { projectsDir: projectsDir ?? null });
+}
+
+export function listProjectFrames(projectDir: string): Promise<ProjectFrame[]> {
+  return invoke<ProjectFrame[]>("list_project_frames", { projectDir });
+}
+
+export function getSparsePreview(projectDir: string): Promise<SparsePreview> {
+  return invoke<SparsePreview>("get_sparse_preview", { projectDir });
 }

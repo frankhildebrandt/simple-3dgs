@@ -21,6 +21,71 @@ export type TrainStats = {
   trainViews?: number | null;
   evalViews?: number | null;
   elapsedSecs?: number | null;
+  etaSecs?: number | null;
+};
+
+export type FramePass = "candidates" | "keyframes" | "import";
+
+export type FrameStats = {
+  pass: FramePass;
+  current?: number | null;
+  total?: number | null;
+  kept?: number | null;
+  elapsedSecs?: number | null;
+  etaSecs?: number | null;
+  durationSecs?: number | null;
+};
+
+export type CameraStep = "features" | "matching" | "calibrating" | "mapping";
+
+export type CameraStats = {
+  step: CameraStep;
+  processed?: number | null;
+  total?: number | null;
+  features?: number | null;
+  matches?: number | null;
+  registered?: number | null;
+  points?: number | null;
+  elapsedSecs?: number | null;
+  etaSecs?: number | null;
+};
+
+export type SparseCamera = {
+  name: string;
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+};
+
+export type SparsePreview = {
+  cameras: SparseCamera[];
+  points: [number, number, number][];
+  colors: [number, number, number][];
+};
+
+export type ProjectFrame = {
+  name: string;
+  path: string;
+  index: number;
+  sharpness: number;
+  motion: number;
+  selected: boolean;
+};
+
+export type ProjectEntry = {
+  id: string;
+  title: string;
+  sourcePath: string;
+  sourceKind: string;
+  settings: PipelineSettings;
+  stage: string;
+  createdAt: string;
+  updatedAt: string;
+  temp: boolean;
+  dir: string;
+  frameCount: number;
+  plyPath?: string | null;
+  hasFrames: boolean;
+  hasCameras: boolean;
 };
 
 export type FrameFormat = "jpg" | "png";
@@ -51,9 +116,10 @@ export type PipelineRequest = {
   tempProject: boolean;
   settings: PipelineSettings;
   force: boolean;
+  until?: Stage;
 };
 
-export type RunStatus = "idle" | "running" | "done" | "error";
+export type RunStatus = "idle" | "running" | "paused" | "done" | "error";
 
 export type AppView = "easy" | "expert" | "archive";
 
@@ -86,12 +152,15 @@ export type AppConfig = {
   uiMode: AppView;
   tempProject: boolean;
   projectDir?: string | null;
+  projectsDir?: string | null;
 };
 
 export type RunResult = {
   plyPath: string;
   archiveId?: string | null;
   archiveError?: string | null;
+  completedStage: Stage;
+  projectDir: string;
 };
 
 export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {

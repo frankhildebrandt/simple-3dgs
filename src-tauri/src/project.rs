@@ -10,6 +10,7 @@ pub const MIN_FRAMES: usize = 8;
 pub const OUTPUT_PLY: &str = "scene.ply";
 pub const OUTPUT_SPZ: &str = "scene.spz";
 pub const VIEW_JSON: &str = "view.json";
+pub const INIT_PLY: &str = "init.ply";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -100,6 +101,14 @@ impl ProjectLayout {
         self.output_dir().join(OUTPUT_PLY)
     }
 
+    pub fn init_ply(&self) -> PathBuf {
+        self.dataset_dir().join(INIT_PLY)
+    }
+
+    pub fn image_list_path(&self) -> PathBuf {
+        self.colmap_dir().join(crate::manifest::IMAGE_LIST_FILE)
+    }
+
     fn marker_path(&self, stage: Stage) -> PathBuf {
         self.root
             .join("markers")
@@ -174,24 +183,34 @@ impl ProjectLayout {
                 remove_dir_contents(&self.dataset_dir())?;
                 self.remove_databases()?;
                 remove_dir_contents(&self.sparse_dir())?;
-                let ply = self.output_ply();
-                if ply.exists() {
-                    fs::remove_file(ply)?;
-                }
+                remove_file_if_exists(&crate::manifest::frames_file(&self.root))?;
+                remove_file_if_exists(&crate::manifest::cameras_file(&self.root))?;
+                remove_file_if_exists(&self.image_list_path())?;
+                remove_matching(&self.output_dir(), |path| {
+                    path.extension().and_then(|e| e.to_str()) == Some("ply")
+                })?;
             }
             Stage::Colmap => {
                 self.remove_databases()?;
                 remove_dir_contents(&self.sparse_dir())?;
                 remove_dir_contents(&self.dataset_dir())?;
-                let ply = self.output_ply();
-                if ply.exists() {
-                    fs::remove_file(ply)?;
-                }
+                remove_file_if_exists(&crate::manifest::cameras_file(&self.root))?;
+                remove_file_if_exists(&self.image_list_path())?;
+                remove_matching(&self.output_dir(), |path| {
+                    path.extension().and_then(|e| e.to_str()) == Some("ply")
+                })?;
             }
             Stage::Train => {
                 let ply = self.output_ply();
                 if ply.exists() {
                     fs::remove_file(ply)?;
+                }
+                remove_matching(&self.output_dir(), |path| {
+                    path.extension().and_then(|e| e.to_str()) == Some("ply")
+                })?;
+                let init = self.init_ply();
+                if init.exists() {
+                    fs::remove_file(init)?;
                 }
             }
         }
@@ -311,9 +330,73 @@ pub fn newest_ply(dir: &Path) -> Option<PathBuf> {
 /// Like [`newest_ply`], but skips files still being written.
 pub fn newest_ready_ply(dir: &Path) -> Option<PathBuf> {
     let path = newest_ply(dir)?;
-    let meta = fs::metadata(&path).ok()?;
+    ready_file(&path)
+}
+
+/// Newest JPEG/PNG in `dir` by mtime.
+pub fn newest_image(dir: &Path) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !is_image(&path) {
+            continue;
+        }
+        let meta = fs::metadata(&path).ok()?;
+        if meta.len() == 0 {
+            continue;
+        }
+        let modified = meta.modified().ok()?;
+        if best.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Like [`newest_image`], but skips files still being written.
+pub fn newest_ready_image(dir: &Path) -> Option<PathBuf> {
+    let path = newest_image(dir)?;
+    ready_file(&path)
+}
+
+/// Newest `export_{iter}.ply` in `dir`, used as Brush warm-start.
+pub fn newest_export_ply(dir: &Path) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut best: Option<(u32, PathBuf)> = None;
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(iter) = export_iter(&path) else {
+            continue;
+        };
+        if best.as_ref().map(|(n, _)| iter > *n).unwrap_or(true) {
+            best = Some((iter, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn export_iter(path: &Path) -> Option<u32> {
+    if path.extension().and_then(|e| e.to_str()) != Some("ply") {
+        return None;
+    }
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("export_")?
+        .parse()
+        .ok()
+}
+
+fn ready_file(path: &Path) -> Option<PathBuf> {
+    let meta = fs::metadata(path).ok()?;
     let age = meta.modified().ok()?.elapsed().ok()?;
-    (age >= Duration::from_millis(250)).then_some(path)
+    (age >= Duration::from_millis(250)).then(|| path.to_path_buf())
 }
 
 /// Picks `scene.ply` or the newest `*.ply` in `export_dir` and copies it to the canonical output.
@@ -360,6 +443,26 @@ fn remove_dir_contents(dir: &Path) -> Result<(), PipelineError> {
         } else {
             fs::remove_file(path)?;
         }
+    }
+    Ok(())
+}
+
+fn remove_matching(dir: &Path, should_remove: impl Fn(&Path) -> bool) -> Result<(), PipelineError> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_file() && should_remove(&path) {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), PipelineError> {
+    if path.exists() {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -441,5 +544,15 @@ mod tests {
         let dest = dir.path().join("output").join(OUTPUT_PLY);
         finalize_ply(&export, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[test]
+    fn newest_export_ply_picks_highest_iter() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("export_50.ply"), b"a").unwrap();
+        fs::write(dir.path().join("export_1000.ply"), b"b").unwrap();
+        fs::write(dir.path().join("scene.ply"), b"c").unwrap();
+        let picked = newest_export_ply(dir.path()).unwrap();
+        assert_eq!(picked.file_name().unwrap(), "export_1000.ply");
     }
 }

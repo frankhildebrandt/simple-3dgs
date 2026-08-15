@@ -19,6 +19,7 @@ const SCENE_MIN_OVERLAP: u32 = 20;
 ///
 /// `database` is used by extractor and matcher. Room mapping uses
 /// `global_database` (a copy the pipeline makes after matching).
+/// `image_list` limits extraction to selected frames when present.
 pub fn reconstruction_specs(
     image_dir: &Path,
     database: &Path,
@@ -26,11 +27,12 @@ pub fn reconstruction_specs(
     settings: PipelineSettings,
     frame_count: usize,
     global_database: &Path,
+    image_list: Option<&Path>,
 ) -> Vec<CommandSpec> {
     let settings = settings.sanitized();
     let mode = settings.capture_mode;
     let mut specs = vec![
-        feature_extractor_spec(image_dir, database, settings).capture(mode),
+        feature_extractor_spec(image_dir, database, settings, image_list).capture(mode),
         matcher_spec(database, settings, frame_count).capture(mode),
     ];
     if mode == CaptureMode::Room {
@@ -46,6 +48,7 @@ pub fn feature_extractor_spec(
     image_dir: &Path,
     database: &Path,
     settings: PipelineSettings,
+    image_list: Option<&Path>,
 ) -> CommandSpec {
     let mut args = vec![
         "feature_extractor".into(),
@@ -60,6 +63,10 @@ pub fn feature_extractor_spec(
         "--FeatureExtraction.use_gpu".into(),
         "0".into(),
     ];
+    if let Some(list) = image_list {
+        args.push("--image_list_path".into());
+        args.push(path_arg(list));
+    }
     if let Some(size) = settings.longest_edge() {
         args.push("--FeatureExtraction.max_image_size".into());
         args.push(size.to_string());
@@ -213,6 +220,7 @@ mod tests {
             settings,
             frame_count,
             Path::new("colmap/database_global.db"),
+            None,
         )
     }
 
@@ -373,6 +381,7 @@ mod tests {
             Path::new("frames"),
             Path::new("db"),
             PipelineSettings::from_preset(Preset::Balanced),
+            None,
         );
         assert!(spec
             .args
@@ -429,5 +438,19 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--Mapper.min_model_size" && w[1] == "6"));
         assert!(!spec.args.iter().any(|a| a == "--Mapper.init_min_tri_angle"));
+    }
+
+    #[test]
+    fn feature_extractor_passes_image_list() {
+        let spec = feature_extractor_spec(
+            Path::new("frames"),
+            Path::new("db"),
+            object_settings(),
+            Some(Path::new("colmap/image_list.txt")),
+        );
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--image_list_path" && w[1] == "colmap/image_list.txt"));
     }
 }

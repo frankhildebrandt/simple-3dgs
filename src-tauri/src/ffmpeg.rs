@@ -129,6 +129,8 @@ fn extract_args(req: ExtractArgs<'_>) -> CommandSpec {
         args.push("-fps_mode".into());
         args.push("vfr".into());
     }
+    args.push("-progress".into());
+    args.push("pipe:1".into());
     match req.format {
         FrameFormat::Jpg => {
             args.push("-q:v".into());
@@ -228,6 +230,10 @@ mod tests {
             .unwrap();
         assert!(vf.contains("fps=8"));
         assert!(vf.contains("320"));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "-progress" && w[1] == "pipe:1"));
         assert_eq!(
             spec.args[spec.args.len() - 1],
             "/tmp/_candidates/frame_%05d.jpg"

@@ -34,6 +34,8 @@ pub struct AppConfig {
     pub temp_project: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects_dir: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -43,6 +45,7 @@ impl Default for AppConfig {
             ui_mode: UiMode::Easy,
             temp_project: true,
             project_dir: None,
+            projects_dir: None,
         }
     }
 }
@@ -144,6 +147,7 @@ mod tests {
         assert_eq!(parsed.ui_mode, UiMode::Easy);
         assert!(parsed.temp_project);
         assert_eq!(parsed.project_dir, None);
+        assert_eq!(parsed.projects_dir, None);
     }
 
     #[test]
@@ -155,12 +159,14 @@ mod tests {
             ui_mode: UiMode::Expert,
             temp_project: false,
             project_dir: Some("/tmp/project".into()),
+            projects_dir: Some("/tmp/projects".into()),
         };
         save(&config_dir, &config).unwrap();
         let raw = fs::read_to_string(config_dir.join("config.json")).unwrap();
         assert!(raw.contains("\"uiMode\": \"expert\""));
         assert!(raw.contains("\"tempProject\": false"));
         assert!(raw.contains("\"projectDir\": \"/tmp/project\""));
+        assert!(raw.contains("\"projectsDir\": \"/tmp/projects\""));
         let loaded = load_or_init(&config_dir, Path::new("/tmp/other")).unwrap();
         assert_eq!(loaded, config);
     }

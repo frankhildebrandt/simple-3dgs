@@ -2,13 +2,17 @@ mod app_config;
 mod archive;
 mod brush;
 mod colmap;
+mod colmap_log;
 mod colmap_pose;
 mod commands;
+mod duration;
 mod error;
 mod ffmpeg;
+mod frame_log;
 mod geo;
 mod html_export;
 mod keyframes;
+mod manifest;
 mod pipeline;
 mod preset;
 mod project;
@@ -51,6 +55,11 @@ pub fn run() {
             commands::export_spz,
             commands::read_splat_file,
             commands::drop_archive_ply,
+            commands::create_project,
+            commands::open_project,
+            commands::list_projects,
+            commands::list_project_frames,
+            commands::get_sparse_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

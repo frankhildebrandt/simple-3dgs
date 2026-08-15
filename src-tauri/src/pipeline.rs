@@ -7,10 +7,14 @@ use std::time::Instant;
 use crate::archive::{ArchiveLibrary, IngestRequest};
 use crate::brush;
 use crate::colmap;
+use crate::colmap_log::CameraSnapshot;
+use crate::colmap_pose;
 use crate::error::PipelineError;
 use crate::ffmpeg;
+use crate::frame_log::{FramePass, FrameSnapshot};
 use crate::geo::{self, GeoFix};
 use crate::keyframes::{self, KeyframeConfig};
+use crate::manifest::{self, FrameEntry, FrameManifest, ProjectManifest};
 use crate::project::{
     assemble_dataset, count_frames, finalize_ply, ProjectLayout, Stage, MIN_FRAMES,
 };
@@ -33,6 +37,7 @@ pub struct PipelineConfig {
     pub kind: InputKind,
     pub settings: PipelineSettings,
     pub force: bool,
+    pub until: Stage,
 }
 
 /// PLY the viewer should load, plus archive ingest outcome.
@@ -41,6 +46,8 @@ pub struct PipelineOutcome {
     pub ply: PathBuf,
     pub archive_id: Option<String>,
     pub archive_error: Option<String>,
+    pub completed_stage: Stage,
+    pub project_dir: PathBuf,
 }
 
 pub trait PipelineEvents {
@@ -48,6 +55,10 @@ pub trait PipelineEvents {
     fn log(&mut self, line: &str);
     fn preview(&mut self, path: &Path);
     fn train_stats(&mut self, _stats: &TrainSnapshot) {}
+    fn frame_stats(&mut self, _stats: &FrameSnapshot) {}
+    fn camera_stats(&mut self, _stats: &CameraSnapshot) {}
+    fn frame_preview(&mut self, _path: &Path) {}
+    fn sparse_preview(&mut self, _preview: &colmap_pose::SparsePreview) {}
 }
 
 /// Runs extract → COLMAP → Brush, then archives the splat. Returns the PLY to display.
@@ -61,14 +72,26 @@ pub fn run_pipeline(
     let project_dir = resolve_project_dir(config, &library)?;
     let layout = ProjectLayout::new(&project_dir);
     layout.create()?;
+    upsert_manifest(config, &layout);
 
     if config.force {
         layout.clear_from(Stage::Frames)?;
     }
 
     run_frames(config, &layout, runner, cancel, events)?;
+    persist_stage(&layout, Stage::Frames);
+    if config.until == Stage::Frames {
+        return Ok(stage_outcome(&layout, Stage::Frames));
+    }
+
     run_colmap(&layout, config.settings, runner, cancel, events)?;
+    persist_stage(&layout, Stage::Colmap);
+    if config.until == Stage::Colmap {
+        return Ok(stage_outcome(&layout, Stage::Colmap));
+    }
+
     run_train(&layout, config.settings, runner, cancel, events)?;
+    persist_stage(&layout, Stage::Train);
 
     events.progress(Stage::Train, 100, "Done");
     archive_outcome(config, &library, &layout, runner, events)
@@ -78,14 +101,56 @@ fn resolve_project_dir(
     config: &PipelineConfig,
     library: &ArchiveLibrary,
 ) -> Result<PathBuf, PipelineError> {
+    if let Some(dir) = &config.project_dir {
+        return Ok(dir.clone());
+    }
     if config.temp_project {
         Ok(library.scratch_dir(&config.source))
     } else {
-        config.project_dir.clone().ok_or_else(|| {
-            PipelineError::message(
-                "Choose a project folder, or enable the temporary project folder.",
-            )
-        })
+        Err(PipelineError::message(
+            "Choose a project folder, or enable the temporary project folder.",
+        ))
+    }
+}
+
+fn persist_stage(layout: &ProjectLayout, stage: Stage) {
+    let path = manifest::project_file(layout.root());
+    if let Ok(mut manifest) = ProjectManifest::load(&path) {
+        manifest.touch_stage(stage);
+        let _ = manifest.save(&path);
+    }
+}
+
+fn upsert_manifest(config: &PipelineConfig, layout: &ProjectLayout) {
+    let path = manifest::project_file(layout.root());
+    let source_kind = match config.kind {
+        InputKind::Video => "video",
+        InputKind::Images => "images",
+    };
+    let mut manifest = ProjectManifest::load(&path).unwrap_or_else(|_| {
+        ProjectManifest::new(
+            manifest::title_from_source(&config.source),
+            config.source.to_string_lossy(),
+            source_kind,
+            config.settings,
+            config.temp_project,
+        )
+    });
+    manifest.source_path = config.source.to_string_lossy().into_owned();
+    manifest.source_kind = source_kind.into();
+    manifest.settings = config.settings;
+    manifest.temp = config.temp_project;
+    manifest.updated_at = chrono::Utc::now().to_rfc3339();
+    let _ = manifest.save(&path);
+}
+
+fn stage_outcome(layout: &ProjectLayout, stage: Stage) -> PipelineOutcome {
+    PipelineOutcome {
+        ply: layout.output_ply(),
+        archive_id: layout.archived_id(),
+        archive_error: None,
+        completed_stage: stage,
+        project_dir: layout.root().to_path_buf(),
     }
 }
 
@@ -98,10 +163,12 @@ fn archive_outcome(
 ) -> Result<PipelineOutcome, PipelineError> {
     if let Some(id) = layout.archived_id() {
         if let Ok(entry) = library.get(&id) {
-            return Ok(PipelineOutcome {
+            return             Ok(PipelineOutcome {
                 ply: PathBuf::from(entry.ply_path),
                 archive_id: Some(id),
                 archive_error: None,
+                completed_stage: Stage::Train,
+                project_dir: layout.root().to_path_buf(),
             });
         }
     }
@@ -131,6 +198,8 @@ fn archive_outcome(
                 ply: PathBuf::from(entry.ply_path),
                 archive_id: Some(entry.meta.id),
                 archive_error: None,
+                completed_stage: Stage::Train,
+                project_dir: layout.root().to_path_buf(),
             })
         }
         Err(err) => {
@@ -140,6 +209,8 @@ fn archive_outcome(
                 ply: layout.output_ply(),
                 archive_id: None,
                 archive_error: Some(message),
+                completed_stage: Stage::Train,
+                project_dir: layout.root().to_path_buf(),
             })
         }
     }
@@ -196,7 +267,14 @@ fn run_frames(
             extract_video_keyframes(&video, layout, config.settings, runner, events)?;
         }
         InputKind::Images => {
+            let mut snap = FrameSnapshot::new(FramePass::Import);
+            events.frame_stats(&snap);
+            events.progress(Stage::Frames, 20, "Importing stills");
             import_image_folder(&config.source, &layout.frames_dir())?;
+            write_still_frames_manifest(layout)?;
+            snap.current = Some(count_frames(&layout.frames_dir())? as u32);
+            snap.total = snap.current;
+            events.frame_stats(&snap);
         }
     }
 
@@ -222,12 +300,16 @@ fn extract_video_keyframes(
     let candidates = layout.candidates_dir();
     let _ = fs::remove_dir_all(&candidates);
     fs::create_dir_all(&candidates)?;
+    let mut snap = FrameSnapshot::new(FramePass::Candidates);
+    events.frame_stats(&snap);
     events.progress(Stage::Frames, 15, "Extracting candidate frames");
     run_ffmpeg_extract(
         runner,
         events,
-        ffmpeg::candidate_spec(video, &candidates, settings),
-        ffmpeg::candidate_spec_with_hwaccel(video, &candidates, settings, false),
+        ffmpeg::candidate_spec(video, &candidates, settings).watching_images(&candidates),
+        ffmpeg::candidate_spec_with_hwaccel(video, &candidates, settings, false)
+            .watching_images(&candidates),
+        &mut snap,
     )?;
 
     events.progress(Stage::Frames, 55, "Selecting keyframes");
@@ -254,15 +336,76 @@ fn extract_video_keyframes(
     } else {
         format!("Extracting {} keyframes", picked.len())
     };
+    snap = FrameSnapshot::new(FramePass::Keyframes);
+    snap.kept = Some(picked.len() as u32);
+    snap.total = Some(picked.len() as u32);
+    events.frame_stats(&snap);
     events.progress(Stage::Frames, 70, &extracting);
     let result = run_ffmpeg_extract(
         runner,
         events,
-        ffmpeg::select_spec(video, &layout.frames_dir(), settings, &picked),
-        ffmpeg::select_spec_with_hwaccel(video, &layout.frames_dir(), settings, &picked, false),
+        ffmpeg::select_spec(video, &layout.frames_dir(), settings, &picked)
+            .watching_images(layout.frames_dir()),
+        ffmpeg::select_spec_with_hwaccel(video, &layout.frames_dir(), settings, &picked, false)
+            .watching_images(layout.frames_dir()),
+        &mut snap,
     );
+    write_video_frames_manifest(layout, settings, &scores, &picked)?;
     let _ = fs::remove_dir_all(&candidates);
     result
+}
+
+fn write_video_frames_manifest(
+    layout: &ProjectLayout,
+    settings: PipelineSettings,
+    scores: &[keyframes::CandidateScore],
+    picked: &[usize],
+) -> Result<(), PipelineError> {
+    let ext = settings.sanitized().frame_format.extension();
+    let frames = picked
+        .iter()
+        .enumerate()
+        .map(|(out, &index)| {
+            let score = scores.get(index).copied().unwrap_or(keyframes::CandidateScore {
+                sharpness: 0.0,
+                motion: 0.0,
+            });
+            FrameEntry {
+                name: format!("frame_{:05}.{ext}", out + 1),
+                index,
+                sharpness: score.sharpness,
+                motion: score.motion,
+                selected: true,
+            }
+        })
+        .collect();
+    FrameManifest { frames }.save(&manifest::frames_file(layout.root()))
+}
+
+fn write_still_frames_manifest(layout: &ProjectLayout) -> Result<(), PipelineError> {
+    let paths = keyframes::list_stills(&layout.frames_dir())?;
+    let scores = keyframes::score_candidates(&layout.frames_dir()).unwrap_or_default();
+    let frames = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let score = scores.get(index).copied().unwrap_or(keyframes::CandidateScore {
+                sharpness: 0.0,
+                motion: 0.0,
+            });
+            FrameEntry {
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                index,
+                sharpness: score.sharpness,
+                motion: score.motion,
+                selected: true,
+            }
+        })
+        .collect();
+    FrameManifest { frames }.save(&manifest::frames_file(layout.root()))
 }
 
 fn run_ffmpeg_extract(
@@ -270,12 +413,13 @@ fn run_ffmpeg_extract(
     events: &mut dyn PipelineEvents,
     primary: CommandSpec,
     fallback: CommandSpec,
+    snap: &mut FrameSnapshot,
 ) -> Result<(), PipelineError> {
-    match run_logged(runner, &primary, events) {
+    match run_ffmpeg_logged(runner, &primary, events, snap) {
         Ok(()) => Ok(()),
         Err(_) => {
             events.log("VideoToolbox decode failed, retrying without hardware acceleration");
-            run_logged(runner, &fallback, events)
+            run_ffmpeg_logged(runner, &fallback, events, snap)
         }
     }
 }
@@ -290,28 +434,36 @@ fn run_colmap(
     cancel.check()?;
     if layout.is_complete(Stage::Colmap) && layout.sparse_model_dir().join("images.bin").is_file() {
         events.progress(Stage::Colmap, 100, "Camera poses already reconstructed");
+        if let Some(preview) = colmap_pose::sparse_preview(&layout.sparse_model_dir()) {
+            events.sparse_preview(&preview);
+        }
         return Ok(());
     }
 
     events.progress(Stage::Colmap, 10, "Estimating camera poses");
     fs::create_dir_all(layout.sparse_dir())?;
-    let frame_count = count_frames(&layout.frames_dir())?;
+    let selected = selected_frame_count(layout)?;
+    let image_list = write_selected_image_list(layout)?;
     let specs = colmap::reconstruction_specs(
         &layout.frames_dir(),
         &layout.database_path(),
         &layout.sparse_dir(),
         settings,
-        frame_count,
+        selected,
         &layout.database_global_path(),
+        Some(&image_list),
     );
     for spec in &specs {
         cancel.check()?;
         if is_view_graph_calibrator(spec) {
             copy_database_for_global(layout)?;
         }
-        let (percent, message) = colmap_progress(spec);
-        events.progress(Stage::Colmap, percent, message);
-        run_logged(runner, spec, events)?;
+        let sub = spec.args.first().map(String::as_str).unwrap_or("");
+        let (mut snap, message) = CameraSnapshot::for_spec(sub);
+        snap.total = Some(selected as u32);
+        events.camera_stats(&snap);
+        events.progress(Stage::Colmap, snap.percent(), message);
+        run_colmap_logged(runner, spec, events, layout, &mut snap, selected as u32)?;
     }
 
     if !layout.sparse_model_dir().join("images.bin").is_file() {
@@ -322,24 +474,68 @@ fn run_colmap(
         ));
     }
     assemble_dataset(layout)?;
+    write_cameras_manifest(layout)?;
+    if let Some(preview) = colmap_pose::sparse_preview(&layout.sparse_model_dir()) {
+        events.sparse_preview(&preview);
+    }
+    let mut done = CameraSnapshot::for_spec("mapper").0;
+    done.set_counts(
+        colmap_pose::registered_count(&layout.sparse_model_dir().join("images.bin")),
+        colmap_pose::points3d_count(&layout.sparse_model_dir().join("points3D.bin")),
+        Some(selected as u32),
+    );
+    events.camera_stats(&done);
     layout.mark_complete(Stage::Colmap)?;
     events.progress(Stage::Colmap, 100, "Sparse reconstruction ready");
     Ok(())
 }
 
-fn is_view_graph_calibrator(spec: &CommandSpec) -> bool {
-    spec.args.first().map(String::as_str) == Some("view_graph_calibrator")
+fn selected_frame_count(layout: &ProjectLayout) -> Result<usize, PipelineError> {
+    let manifest = FrameManifest::load(&manifest::frames_file(layout.root()))?;
+    let selected = manifest.selected_names().len();
+    if selected > 0 {
+        Ok(selected)
+    } else {
+        count_frames(&layout.frames_dir())
+    }
 }
 
-/// Progress percent and label from the COLMAP subcommand in `args[0]`.
-fn colmap_progress(spec: &CommandSpec) -> (u8, &'static str) {
-    match spec.args.first().map(String::as_str) {
-        Some("feature_extractor") => (20, "Extracting features"),
-        Some("sequential_matcher" | "exhaustive_matcher") => (50, "Matching views"),
-        Some("view_graph_calibrator") => (70, "Calibrating cameras"),
-        Some("mapper" | "global_mapper") => (85, "Mapping cameras"),
-        _ => (10, "Estimating camera poses"),
-    }
+fn write_selected_image_list(layout: &ProjectLayout) -> Result<PathBuf, PipelineError> {
+    let manifest = FrameManifest::load(&manifest::frames_file(layout.root()))?;
+    let names = if manifest.frames.is_empty() {
+        keyframes::list_stills(&layout.frames_dir())?
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        manifest
+            .selected_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+    let path = layout.image_list_path();
+    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+    manifest::write_image_list(&path, &borrowed)?;
+    Ok(path)
+}
+
+fn write_cameras_manifest(layout: &ProjectLayout) -> Result<(), PipelineError> {
+    let frames = FrameManifest::load(&manifest::frames_file(layout.root()))?;
+    let names: Vec<String> = if frames.frames.is_empty() {
+        keyframes::list_stills(&layout.frames_dir())?
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect()
+    } else {
+        frames.frames.iter().map(|f| f.name.clone()).collect()
+    };
+    let cameras = colmap_pose::camera_manifest(&layout.sparse_model_dir(), &names);
+    cameras.save(&manifest::cameras_file(layout.root()))
+}
+
+fn is_view_graph_calibrator(spec: &CommandSpec) -> bool {
+    spec.args.first().map(String::as_str) == Some("view_graph_calibrator")
 }
 
 /// Copies `database.db` to `database_global.db` so the calibrator never mutates the original.
@@ -368,6 +564,7 @@ fn run_train(
         return Ok(());
     }
 
+    warm_start_from_export(layout, events)?;
     events.progress(
         Stage::Train,
         15,
@@ -396,6 +593,25 @@ fn run_train(
     Ok(())
 }
 
+/// Copies the newest `export_{iter}.ply` to `dataset/init.ply` so Brush can warm-start.
+fn warm_start_from_export(
+    layout: &ProjectLayout,
+    events: &mut dyn PipelineEvents,
+) -> Result<(), PipelineError> {
+    let Some(src) = crate::project::newest_export_ply(&layout.output_dir()) else {
+        return Ok(());
+    };
+    fs::create_dir_all(layout.dataset_dir())?;
+    fs::copy(&src, layout.init_ply())?;
+    events.log(&format!(
+        "Continue from {} as dataset/init.ply (warm start, not a full checkpoint)",
+        src.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    Ok(())
+}
+
 fn run_train_logged(
     runner: &mut dyn SidecarRunner,
     spec: &CommandSpec,
@@ -413,6 +629,7 @@ fn run_train_logged(
             let mut snap = snap.borrow_mut();
             let changed = snap.ingest(line);
             snap.elapsed_secs = Some(started.elapsed().as_secs());
+            snap.refresh_eta();
             let mut ev = events.borrow_mut();
             ev.log(line);
             if changed {
@@ -424,6 +641,7 @@ fn run_train_logged(
             let mut snap = snap.borrow_mut();
             snap.ingest_export(path);
             snap.elapsed_secs = Some(started.elapsed().as_secs());
+            snap.refresh_eta();
             let mut ev = events.borrow_mut();
             ev.preview(path);
             ev.log(&format!("Preview checkpoint {}", path.display()));
@@ -433,16 +651,85 @@ fn run_train_logged(
     )
 }
 
-fn run_logged(
+fn run_ffmpeg_logged(
     runner: &mut dyn SidecarRunner,
     spec: &CommandSpec,
     events: &mut dyn PipelineEvents,
+    snap: &mut FrameSnapshot,
 ) -> Result<(), PipelineError> {
+    let started = Instant::now();
     let events = std::cell::RefCell::new(events);
+    let snap = std::cell::RefCell::new(snap);
     runner.run(
         spec,
-        &mut |line| events.borrow_mut().log(line),
-        &mut |path| events.borrow_mut().preview(path),
+        &mut |line| {
+            let mut snap = snap.borrow_mut();
+            let changed = snap.ingest(line);
+            snap.elapsed_secs = Some(started.elapsed().as_secs());
+            let mut ev = events.borrow_mut();
+            ev.log(line);
+            if changed {
+                ev.frame_stats(&snap);
+                ev.progress(Stage::Frames, snap.percent().max(5), &snap.summary());
+            }
+        },
+        &mut |path| {
+            let mut ev = events.borrow_mut();
+            if crate::project::is_image(path) {
+                ev.frame_preview(path);
+            } else {
+                ev.preview(path);
+            }
+        },
+    )
+}
+
+fn run_colmap_logged(
+    runner: &mut dyn SidecarRunner,
+    spec: &CommandSpec,
+    events: &mut dyn PipelineEvents,
+    layout: &ProjectLayout,
+    snap: &mut CameraSnapshot,
+    frame_total: u32,
+) -> Result<(), PipelineError> {
+    let started = Instant::now();
+    let events = std::cell::RefCell::new(events);
+    let snap = std::cell::RefCell::new(snap);
+    let last_sparse = std::cell::Cell::new(started);
+    runner.run(
+        spec,
+        &mut |line| {
+            let mut snap = snap.borrow_mut();
+            let changed = snap.ingest(line);
+            snap.elapsed_secs = Some(started.elapsed().as_secs());
+            let mut ev = events.borrow_mut();
+            ev.log(line);
+            if changed {
+                ev.camera_stats(&snap);
+                ev.progress(Stage::Colmap, snap.percent(), &snap.summary());
+            }
+            if last_sparse.get().elapsed().as_millis() >= 500 {
+                last_sparse.set(Instant::now());
+                if let Some(preview) = colmap_pose::sparse_preview(&layout.sparse_model_dir()) {
+                    snap.set_counts(
+                        Some(preview.cameras.len() as u32),
+                        Some(preview.points.len() as u32),
+                        Some(frame_total),
+                    );
+                    ev.sparse_preview(&preview);
+                    ev.camera_stats(&snap);
+                    ev.progress(Stage::Colmap, snap.percent(), &snap.summary());
+                }
+            }
+        },
+        &mut |path| {
+            let mut ev = events.borrow_mut();
+            if crate::project::is_image(path) {
+                ev.frame_preview(path);
+            } else {
+                ev.preview(path);
+            }
+        },
     )
 }
 
@@ -542,6 +829,7 @@ mod tests {
             kind,
             settings: PipelineSettings::from_preset(Preset::Fast),
             force: false,
+            until: Stage::Train,
         }
     }
 
@@ -780,5 +1068,76 @@ mod tests {
             .unwrap()
             .scratch_dir(&config.source);
         assert!(scratch.is_dir(), "failed runs keep scratch for resume");
+    }
+
+    #[test]
+    fn until_frames_skips_colmap_and_writes_manifest() {
+        let dir = tempdir().unwrap();
+        let images = dir.path().join("photos");
+        fs::create_dir_all(&images).unwrap();
+        for i in 0..8 {
+            fs::write(images.join(format!("{i:02}.png")), b"img").unwrap();
+        }
+        let mut config = cfg(dir.path(), images, InputKind::Images);
+        config.until = Stage::Frames;
+        let mut runner = FakeRunner::new();
+        let mut events = CollectingEvents::new();
+        let outcome = run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
+        assert!(runner.calls.iter().all(|c| c.sidecar != "colmap"));
+        assert_eq!(outcome.completed_stage, Stage::Frames);
+        let frames = FrameManifest::load(&manifest::frames_file(config.project_dir.as_ref().unwrap()))
+            .unwrap();
+        assert_eq!(frames.frames.len(), 8);
+        assert!(frames.frames.iter().all(|f| f.selected));
+    }
+
+    #[test]
+    fn colmap_receives_image_list_path() {
+        let dir = tempdir().unwrap();
+        let images = dir.path().join("photos");
+        fs::create_dir_all(&images).unwrap();
+        for i in 0..8 {
+            fs::write(images.join(format!("{i:02}.png")), b"img").unwrap();
+        }
+        let config = cfg(dir.path(), images, InputKind::Images);
+        let mut runner = FakeRunner::new();
+        let mut events = CollectingEvents::new();
+        run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
+        let extractor = runner
+            .calls
+            .iter()
+            .find(|c| c.sidecar == "colmap" && c.args.first().map(String::as_str) == Some("feature_extractor"))
+            .unwrap();
+        assert!(extractor
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--image_list_path"));
+    }
+
+    #[test]
+    fn unfinished_train_copies_export_as_init_ply() {
+        let dir = tempdir().unwrap();
+        let images = dir.path().join("photos");
+        fs::create_dir_all(&images).unwrap();
+        for i in 0..8 {
+            fs::write(images.join(format!("{i:02}.png")), b"img").unwrap();
+        }
+        let mut config = cfg(dir.path(), images, InputKind::Images);
+        config.until = Stage::Colmap;
+        let mut runner = FakeRunner::new();
+        let mut events = CollectingEvents::new();
+        run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
+        let layout = ProjectLayout::new(config.project_dir.as_ref().unwrap());
+        fs::write(layout.output_dir().join("export_1000.ply"), b"ply").unwrap();
+        config.until = Stage::Train;
+        let mut runner2 = FakeRunner::new();
+        let mut events2 = CollectingEvents::new();
+        run_pipeline(&config, &mut runner2, &CancelFlag::new(), &mut events2).unwrap();
+        assert!(layout.init_ply().is_file());
+        assert!(runner2.calls.iter().any(|c| c.sidecar == "brush"));
+        assert!(events2
+            .logs
+            .iter()
+            .any(|line| line.contains("init.ply") || line.contains("export_1000")));
     }
 }
