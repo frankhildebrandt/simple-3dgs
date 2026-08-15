@@ -118,6 +118,13 @@ fn parse_export_iter(path: &Path) -> Option<u32> {
         .ok()
 }
 
+/// Brush detaches `cli-trainer`, so a Burn panic still prints "Done training" and may exit 0.
+pub fn trainer_panicked(text: &str) -> bool {
+    text.contains("Ordering is bigger than operations")
+        || text.contains("panicked at")
+        || text.contains("CallError(task panicked")
+}
+
 fn strip_log_prefix(line: &str) -> &str {
     let line = line.trim();
     if let Some(idx) = line.find("Loaded dataset") {
@@ -187,6 +194,23 @@ mod tests {
         let mut snap = TrainSnapshot::new(1000);
         assert!(!snap.ingest("Starting up"));
         assert_eq!(snap.iter, None);
+    }
+
+    #[test]
+    fn trainer_panicked_catches_burn_fusion_and_ignores_done() {
+        assert!(trainer_panicked(
+            "Ordering is bigger than operations: ordering len 49, operations len 0"
+        ));
+        assert!(trainer_panicked(
+            "thread 'cli-trainer' panicked at /Users/frank/.cargo/git/checkouts/burn-6c277d792b0d5d7a/b6e27bd/crates/burn-fusion/src/client.rs:200:14:"
+        ));
+        assert!(trainer_panicked(
+            "called `Result::unwrap()` on an `Err` value: CallError(task panicked on device runner thread: Ordering is bigger than operations)"
+        ));
+        assert!(!trainer_panicked(
+            "INFO brush_cli: Done training! Took FormattedDuration(1s)."
+        ));
+        assert!(!trainer_panicked("Refine iter 50, 12000 splats."));
     }
 
     #[test]

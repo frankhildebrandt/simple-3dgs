@@ -14,7 +14,7 @@ use crate::keyframes::{self, KeyframeConfig};
 use crate::project::{
     assemble_dataset, count_frames, finalize_ply, ProjectLayout, Stage, MIN_FRAMES,
 };
-use crate::settings::PipelineSettings;
+use crate::settings::{ExtractMode, PipelineSettings};
 use crate::sidecar::{CancelFlag, CommandSpec, SidecarRunner};
 use crate::train_log::TrainSnapshot;
 
@@ -232,7 +232,8 @@ fn extract_video_keyframes(
 
     events.progress(Stage::Frames, 55, "Selecting keyframes");
     let scores = keyframes::score_candidates(&candidates)?;
-    let picked = keyframes::select_keyframes(&scores, KeyframeConfig::from_settings(settings));
+    let config = KeyframeConfig::from_settings(settings);
+    let picked = keyframes::select_keyframes(&scores, config);
     if picked.is_empty() {
         let _ = fs::remove_dir_all(&candidates);
         return Err(PipelineError::message(
@@ -242,11 +243,18 @@ fn extract_video_keyframes(
 
     let _ = fs::remove_dir_all(layout.frames_dir());
     fs::create_dir_all(layout.frames_dir())?;
-    events.progress(
-        Stage::Frames,
-        70,
-        &format!("Extracting {} keyframes", picked.len()),
-    );
+    let extracting = if settings.sanitized().extract_mode == ExtractMode::Change
+        && picked.len() >= config.max_keep
+    {
+        format!(
+            "Extracting {} keyframes (capped at {})",
+            picked.len(),
+            config.max_keep
+        )
+    } else {
+        format!("Extracting {} keyframes", picked.len())
+    };
+    events.progress(Stage::Frames, 70, &extracting);
     let result = run_ffmpeg_extract(
         runner,
         events,

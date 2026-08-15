@@ -188,6 +188,7 @@ impl SidecarRunner for ProcessRunner {
         let mut tail = Vec::new();
         let mut last_preview: Option<PathBuf> = None;
         let mut ticks: u32 = 0;
+        let mut brush_panicked = false;
         let status = loop {
             self.cancel.check().map_err(|err| {
                 let _ = child.kill();
@@ -198,7 +199,7 @@ impl SidecarRunner for ProcessRunner {
                 Some(status) => break status,
                 None => {
                     while let Ok(line) = rx.try_recv() {
-                        remember(&mut tail, log, line);
+                        brush_panicked |= take_line(spec, &mut tail, log, line);
                     }
                     ticks = ticks.saturating_add(1);
                     if ticks % 10 == 0 {
@@ -209,26 +210,17 @@ impl SidecarRunner for ProcessRunner {
             }
         };
         while let Ok(line) = rx.try_recv() {
-            remember(&mut tail, log, line);
+            brush_panicked |= take_line(spec, &mut tail, log, line);
         }
         emit_preview(spec, &mut last_preview, preview);
 
-        if status.success() {
-            Ok(())
-        } else {
-            let code = status.code().unwrap_or(-1);
-            let detail = tail.join("\n");
-            Err(match spec.sidecar {
-                "ffmpeg" => PipelineError::ffmpeg_failed(code),
-                "colmap" => PipelineError::colmap_failed_with(code, &detail, spec.capture_mode),
-                "brush" => PipelineError::brush_failed(code),
-                other => PipelineError::Sidecar {
-                    tool: other.into(),
-                    code,
-                    hint: "The sidecar exited with an error.".into(),
-                },
-            })
-        }
+        sidecar_result(
+            spec,
+            status.success(),
+            status.code().unwrap_or(-1),
+            brush_panicked,
+            &tail,
+        )
     }
 }
 
@@ -238,6 +230,45 @@ fn remember(tail: &mut Vec<String>, log: &mut dyn FnMut(&str), line: String) {
     if tail.len() > 40 {
         tail.remove(0);
     }
+}
+
+/// Logs `line` and reports whether Brush's trainer thread panicked in it.
+fn take_line(
+    spec: &CommandSpec,
+    tail: &mut Vec<String>,
+    log: &mut dyn FnMut(&str),
+    line: String,
+) -> bool {
+    let panicked = spec.sidecar == "brush" && crate::train_log::trainer_panicked(&line);
+    remember(tail, log, line);
+    panicked
+}
+
+/// Brush may panic on `cli-trainer` and still exit 0 after printing "Done training".
+fn sidecar_result(
+    spec: &CommandSpec,
+    exit_ok: bool,
+    code: i32,
+    brush_panicked: bool,
+    tail: &[String],
+) -> Result<(), PipelineError> {
+    let detail = tail.join("\n");
+    if spec.sidecar == "brush" && brush_panicked {
+        return Err(PipelineError::brush_failed_with(code, &detail));
+    }
+    if exit_ok {
+        return Ok(());
+    }
+    Err(match spec.sidecar {
+        "ffmpeg" => PipelineError::ffmpeg_failed(code),
+        "colmap" => PipelineError::colmap_failed_with(code, &detail, spec.capture_mode),
+        "brush" => PipelineError::brush_failed_with(code, &detail),
+        other => PipelineError::Sidecar {
+            tool: other.into(),
+            code,
+            hint: "The sidecar exited with an error.".into(),
+        },
+    })
 }
 
 fn emit_preview(spec: &CommandSpec, last: &mut Option<PathBuf>, preview: &mut dyn FnMut(&Path)) {
@@ -408,6 +439,25 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brush_panic_fails_even_when_exit_is_zero() {
+        let spec = CommandSpec::new("brush", vec![]);
+        let tail = vec![
+            "Ordering is bigger than operations: ordering len 49, operations len 0".into(),
+            "INFO brush_cli: Done training! Took FormattedDuration(1s).".into(),
+        ];
+        let err = sidecar_result(&spec, true, 0, true, &tail).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Brush"));
+        assert!(msg.contains("Burn fusion"));
+    }
+
+    #[test]
+    fn brush_clean_exit_stays_ok() {
+        let spec = CommandSpec::new("brush", vec![]);
+        sidecar_result(&spec, true, 0, false, &["Done training!".into()]).unwrap();
+    }
 
     #[test]
     fn fake_runner_records_calls() {

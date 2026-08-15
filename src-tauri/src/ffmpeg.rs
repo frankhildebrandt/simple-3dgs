@@ -1,5 +1,6 @@
 //! FFmpeg frame extraction command construction.
 
+use std::fs;
 use std::path::Path;
 
 use crate::keyframes;
@@ -7,11 +8,13 @@ use crate::settings::{FrameFormat, PipelineSettings};
 use crate::sidecar::{path_arg, CommandSpec};
 
 pub const THUMB_EDGE: u32 = 320;
+pub const FILTER_SCRIPT_MIN_INDICES: usize = 500;
+pub const SELECT_FILTER_FILE: &str = "select.filter";
 
 /// Builds the FFmpeg `-vf` filter for extract rate and optional longest-edge scale.
 #[cfg(test)]
 pub fn video_filter(fps: f32, max_width: Option<u32>) -> String {
-    filter_graph(fps, None, max_width)
+    filter_graph(fps, None, max_width, true)
 }
 
 /// Dense low-res thumbs used to score sharpness and motion.
@@ -31,7 +34,7 @@ pub fn candidate_spec_with_hwaccel(
         out_dir: thumbs_dir,
         settings,
         hwaccel,
-        fps: keyframes::candidate_fps(settings.fps),
+        fps: keyframes::candidate_fps_for(settings),
         max_width: Some(THUMB_EDGE),
         indices: None,
         format: FrameFormat::Jpg,
@@ -40,6 +43,7 @@ pub fn candidate_spec_with_hwaccel(
 }
 
 /// Full-resolution stills at the selected candidate indices (`n` after `fps=`).
+/// Lists of 500+ indices write `select.filter` next to the stills and use `-filter_script`.
 pub fn select_spec(
     video: &Path,
     frames_dir: &Path,
@@ -62,7 +66,7 @@ pub fn select_spec_with_hwaccel(
         out_dir: frames_dir,
         settings,
         hwaccel,
-        fps: keyframes::candidate_fps(settings.fps),
+        fps: keyframes::candidate_fps_for(settings),
         max_width: settings.longest_edge(),
         indices: Some(indices),
         format: settings.frame_format,
@@ -120,8 +124,7 @@ fn extract_args(req: ExtractArgs<'_>) -> CommandSpec {
         args.push("-t".into());
         args.push(format_seconds(req.settings.duration_seconds));
     }
-    args.push("-vf".into());
-    args.push(filter_graph(req.fps, req.indices, req.max_width));
+    push_filter(&mut args, &req);
     if req.variable_rate {
         args.push("-fps_mode".into());
         args.push("vfr".into());
@@ -141,12 +144,36 @@ fn extract_args(req: ExtractArgs<'_>) -> CommandSpec {
     CommandSpec::new("ffmpeg", args)
 }
 
-fn filter_graph(fps: f32, indices: Option<&[usize]>, max_width: Option<u32>) -> String {
+/// Writes a filter script when the select expression would overflow ARG_MAX.
+fn push_filter(args: &mut Vec<String>, req: &ExtractArgs<'_>) {
+    let use_script = req
+        .indices
+        .is_some_and(|indices| indices.len() >= FILTER_SCRIPT_MIN_INDICES);
+    if use_script {
+        let path = req.out_dir.join(SELECT_FILTER_FILE);
+        let graph = filter_graph(req.fps, req.indices, req.max_width, false);
+        if fs::write(&path, graph).is_ok() {
+            args.push("-filter_script".into());
+            args.push(path_arg(&path));
+            return;
+        }
+    }
+    args.push("-vf".into());
+    args.push(filter_graph(req.fps, req.indices, req.max_width, true));
+}
+
+fn filter_graph(
+    fps: f32,
+    indices: Option<&[usize]>,
+    max_width: Option<u32>,
+    escape_select: bool,
+) -> String {
     let mut parts = vec![format!("fps={fps}")];
     if let Some(indices) = indices {
+        let sep = if escape_select { "\\," } else { "," };
         let expr = indices
             .iter()
-            .map(|index| format!("eq(n\\,{index})"))
+            .map(|index| format!("eq(n{sep}{index})"))
             .collect::<Vec<_>>()
             .join("+");
         parts.push(format!("select='{expr}'"));
@@ -165,8 +192,10 @@ fn format_seconds(value: f32) -> String {
 mod tests {
     use super::*;
     use crate::preset::Preset;
-    use crate::settings::FrameFormat;
+    use crate::settings::{ExtractMode, FrameFormat};
+    use std::fs;
     use std::path::Path;
+    use tempfile::tempdir;
 
     fn balanced() -> PipelineSettings {
         PipelineSettings::from_preset(Preset::Balanced)
@@ -290,5 +319,43 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "-f" && w[1] == "ffmetadata"));
         assert_eq!(spec.args.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn change_quality_100_uses_dense_candidate_fps() {
+        let mut settings = balanced();
+        settings.extract_mode = ExtractMode::Change;
+        settings.extract_quality = 100;
+        let spec = candidate_spec(
+            Path::new("/tmp/in.mp4"),
+            Path::new("/tmp/_candidates"),
+            settings,
+        );
+        let vf = spec
+            .args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].as_str())
+            .unwrap();
+        assert!(vf.contains("fps=24"), "got {vf}");
+    }
+
+    #[test]
+    fn many_indices_use_filter_script() {
+        let dir = tempdir().unwrap();
+        let frames = dir.path().join("frames");
+        fs::create_dir_all(&frames).unwrap();
+        let indices: Vec<_> = (0..FILTER_SCRIPT_MIN_INDICES).collect();
+        let spec = select_spec(Path::new("clip.mp4"), &frames, balanced(), &indices);
+        let script = frames.join(SELECT_FILTER_FILE);
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "-filter_script" && w[1] == path_arg(&script)));
+        assert!(!spec.args.contains(&"-vf".into()));
+        let graph = fs::read_to_string(&script).unwrap();
+        assert!(graph.contains("eq(n,0)"));
+        assert!(graph.contains(&format!("eq(n,{})", FILTER_SCRIPT_MIN_INDICES - 1)));
+        assert!(!graph.contains("eq(n\\,0)"));
     }
 }

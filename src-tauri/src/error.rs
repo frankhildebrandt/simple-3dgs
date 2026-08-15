@@ -55,10 +55,20 @@ impl PipelineError {
     }
 
     pub fn brush_failed(code: i32) -> Self {
+        Self::brush_failed_with(code, "")
+    }
+
+    /// Uses `log` so a Burn fusion panic is not reported as a clean Metal/RAM failure.
+    pub fn brush_failed_with(code: i32, log: &str) -> Self {
+        let hint = if crate::train_log::trainer_panicked(log) {
+            "Brush's GPU trainer panicked in Burn fusion. The CLI still reports Done training. Retry the run; if it keeps failing, lower max splats or train resolution.".into()
+        } else {
+            "Training stopped early. Check GPU/Metal availability and free memory (16 GB RAM minimum).".into()
+        };
         Self::Sidecar {
             tool: "Brush".into(),
             code,
-            hint: "Training stopped early. Check GPU/Metal availability and free memory (16 GB RAM minimum).".into(),
+            hint,
         }
     }
 
@@ -142,6 +152,16 @@ mod tests {
         assert!(msg.contains("Documents/Simple 3DGS/archive"));
         assert!(msg.contains("Files and Folders"));
         assert!(!msg.contains("I/O error"));
+    }
+
+    #[test]
+    fn brush_fusion_panic_is_not_blamed_on_ram() {
+        let log = "thread 'cli-trainer' panicked at burn-fusion/src/client.rs:200:14:\nOrdering is bigger than operations";
+        let msg = PipelineError::brush_failed_with(0, log).to_string();
+        assert!(msg.contains("Burn fusion"));
+        assert!(!msg.contains("16 GB"));
+        let generic = PipelineError::brush_failed(1).to_string();
+        assert!(generic.contains("16 GB"));
     }
 
     #[test]

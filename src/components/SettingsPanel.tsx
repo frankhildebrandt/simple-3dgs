@@ -76,38 +76,81 @@ function Knob({
 export function SettingsPanel({ value, sourceKind, disabled, onChange }: Props) {
   const video = sourceKind === "video";
   const nativeSize = value.maxImageSize === 0;
+  const change = value.extractMode === "change";
 
   return (
     <div className="settings">
       <fieldset disabled={disabled}>
         <legend>Frames</legend>
-        <Knob
-          label="Target density"
-          hint="Frame density while the camera moves. Ignored for image folders."
-          min={0.25}
-          max={12}
-          step={0.25}
-          value={value.fps}
-          disabled={!video}
-          dim={!video}
-          onChange={(fps) => onChange({ ...value, fps })}
-        />
-        <Knob
-          label="Max frames"
-          hint={
-            value.captureMode === "outdoor"
-              ? "Hard cap on extracted video frames. Outdoor allows up to 10,000."
-              : "Hard cap on extracted video frames."
-          }
-          min={8}
-          max={maxFramesCap(value.captureMode)}
-          step={1}
-          value={value.maxFrames}
-          disabled={!video}
-          dim={!video}
-          onChange={(maxFrames) => onChange({ ...value, maxFrames })}
-        />
-        {video && value.captureMode === "room" && value.maxFrames > 250 ? (
+        <label
+          className={`format ${video ? "" : "dim"}`.trim()}
+          title="Density uses a target fps and cap. Change takes a new frame when the picture moves."
+          data-hint="Density uses a target fps and cap. Change takes a new frame when the picture moves."
+        >
+          <span>Extract</span>
+          <div className="row">
+            <button
+              type="button"
+              className={!change ? "selected" : ""}
+              disabled={!video}
+              onClick={() => onChange({ ...value, extractMode: "density" })}
+            >
+              Density
+            </button>
+            <button
+              type="button"
+              className={change ? "selected" : ""}
+              disabled={!video}
+              onClick={() => onChange({ ...value, extractMode: "change" })}
+            >
+              Change
+            </button>
+          </div>
+          <output>{change ? "on change" : "by density"}</output>
+        </label>
+        {change ? (
+          <Knob
+            label="Extract quality"
+            hint="How soon a new frame is taken when the picture changes. 100 keeps more overlap. Frame count follows camera motion."
+            min={1}
+            max={100}
+            step={1}
+            value={value.extractQuality}
+            disabled={!video}
+            dim={!video}
+            onChange={(extractQuality) => onChange({ ...value, extractQuality })}
+          />
+        ) : (
+          <>
+            <Knob
+              label="Target density"
+              hint="Frame density while the camera moves. Ignored for image folders."
+              min={0.25}
+              max={12}
+              step={0.25}
+              value={value.fps}
+              disabled={!video}
+              dim={!video}
+              onChange={(fps) => onChange({ ...value, fps })}
+            />
+            <Knob
+              label="Max frames"
+              hint={
+                value.captureMode === "outdoor"
+                  ? "Hard cap on extracted video frames. Outdoor allows up to 10,000."
+                  : "Hard cap on extracted video frames."
+              }
+              min={8}
+              max={maxFramesCap(value.captureMode)}
+              step={1}
+              value={value.maxFrames}
+              disabled={!video}
+              dim={!video}
+              onChange={(maxFrames) => onChange({ ...value, maxFrames })}
+            />
+          </>
+        )}
+        {video && value.captureMode === "room" && (change || value.maxFrames > 250) ? (
           <p className="note">
             Exhaustive matching only up to 250 frames; extra frames use sequential matching.
           </p>

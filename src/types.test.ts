@@ -11,6 +11,12 @@ describe("matchingPreset", () => {
       matchingPreset({ ...PRESET_SETTINGS.balanced, maxFrames: 400 }),
     ).toBeNull();
   });
+
+  it("is null in change extract mode", () => {
+    expect(
+      matchingPreset({ ...PRESET_SETTINGS.balanced, extractMode: "change" }),
+    ).toBeNull();
+  });
 });
 
 describe("maxFramesCap", () => {

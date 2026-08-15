@@ -9,13 +9,19 @@ export async function openSplatWindow(id: string, title: string): Promise<void> 
     await existing.setFocus();
     return;
   }
-  new WebviewWindow(label, {
+  const created = new WebviewWindow(label, {
     url: splatWindowUrl(id),
     title,
     width: 1280,
     height: 800,
     minWidth: 640,
     minHeight: 480,
+  });
+  await new Promise<void>((resolve, reject) => {
+    void created.once("tauri://created", () => resolve());
+    void created.once("tauri://error", (event) => {
+      reject(new Error(String(event.payload)));
+    });
   });
 }
 

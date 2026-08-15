@@ -25,6 +25,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::new())
+        .setup(|app| {
+            // First Documents/archive touch must be on the main thread or macOS
+            // TCC returns EPERM without a prompt (IPC commands run on a worker).
+            if let Err(err) = commands::load_config(app.handle()) {
+                eprintln!("archive access: {err}");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::start_pipeline,
             commands::cancel_pipeline,

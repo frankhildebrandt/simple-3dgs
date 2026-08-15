@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as THREE from "three";
 import { SparkControls, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import { LookCapture, isLookCaptureClick, isLookReleaseKey } from "../lookCapture";
 import { applyPointerLook } from "../pointerLook";
 import { jpegBase64FromCanvas, scaledJpegDataUrl } from "../previewCapture";
-import { loadPlyBytes } from "../spzTranscode";
-import { splatFileName, splatKindFromPath } from "../splatFile";
+import { loadPlyBytes, splatBytesFromInvoke } from "../spzTranscode";
+import { splatFileName, splatKindFromPath, splatLoadHint, splatSidecarPath } from "../splatFile";
+import { readSplatFile } from "../api";
 import type { CaptureMode } from "../types";
 import {
   applyViewerMode,
@@ -117,17 +117,13 @@ function dropSplat(mesh: SplatMesh) {
 }
 
 async function loadViewPose(plyPath: string): Promise<ViewPose | null> {
-  const slash = plyPath.lastIndexOf("/");
-  if (slash < 0) {
+  const sidecar = splatSidecarPath(plyPath, "view.json");
+  if (!sidecar) {
     return null;
   }
-  const url = convertFileSrc(`${plyPath.slice(0, slash)}/view.json`);
   try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      return null;
-    }
-    const data = (await response.json()) as ViewPose;
+    const bytes = splatBytesFromInvoke(await readSplatFile(sidecar));
+    const data = JSON.parse(new TextDecoder().decode(bytes)) as ViewPose;
     if (!Array.isArray(data.position) || !Array.isArray(data.quaternion)) {
       return null;
     }
@@ -423,7 +419,7 @@ export function SplatViewer({
           pendingPathRef.current = shownPathRef.current;
         }
         console.error("Checkpoint failed to load", path, err);
-        setLoadError("Checkpoint failed to load");
+        setLoadError(splatLoadHint(err));
       } finally {
         loadingRef.current = false;
         if (worldRef.current === world && pendingPathRef.current !== shownPathRef.current) {

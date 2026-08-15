@@ -42,6 +42,15 @@ impl FrameFormat {
     }
 }
 
+/// How video stills are chosen. Density uses fps plus a frame cap; Change uses picture motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtractMode {
+    #[default]
+    Density,
+    Change,
+}
+
 /// User-facing reconstruction settings. Zeroed time fields mean "whole clip".
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +73,12 @@ pub struct PipelineSettings {
     /// Hard cap on motion-adaptive video keyframes. Missing in old archive JSON.
     #[serde(default = "default_max_frames")]
     pub max_frames: u32,
+    /// Density (fps + max frames) or Change (quality 1–100). Missing in old archive JSON.
+    #[serde(default)]
+    pub extract_mode: ExtractMode,
+    /// Change-mode overlap quality. 100 extracts sooner when the picture moves.
+    #[serde(default = "default_extract_quality")]
+    pub extract_quality: u8,
 }
 
 fn default_jpeg_quality() -> u8 {
@@ -76,6 +91,10 @@ fn default_max_splats() -> u32 {
 
 fn default_max_frames() -> u32 {
     250
+}
+
+fn default_extract_quality() -> u8 {
+    55
 }
 
 impl PipelineSettings {
@@ -93,6 +112,8 @@ impl PipelineSettings {
                 capture_mode: CaptureMode::Object,
                 max_splats: 2_000_000,
                 max_frames: 120,
+                extract_mode: ExtractMode::Density,
+                extract_quality: default_extract_quality(),
             },
             Preset::Balanced => Self {
                 fps: 2.0,
@@ -106,6 +127,8 @@ impl PipelineSettings {
                 capture_mode: CaptureMode::Object,
                 max_splats: 5_000_000,
                 max_frames: 250,
+                extract_mode: ExtractMode::Density,
+                extract_quality: default_extract_quality(),
             },
             Preset::Quality => Self {
                 fps: 4.0,
@@ -119,6 +142,8 @@ impl PipelineSettings {
                 capture_mode: CaptureMode::Object,
                 max_splats: 10_000_000,
                 max_frames: 500,
+                extract_mode: ExtractMode::Density,
+                extract_quality: default_extract_quality(),
             },
         }
     }
@@ -140,6 +165,8 @@ impl PipelineSettings {
             capture_mode: self.capture_mode,
             max_splats: self.max_splats.clamp(100_000, 20_000_000),
             max_frames: self.max_frames.clamp(8, self.capture_mode.max_frames_cap()),
+            extract_mode: self.extract_mode,
+            extract_quality: self.extract_quality.clamp(1, 100),
         }
     }
 
@@ -256,6 +283,34 @@ mod tests {
         assert_eq!(settings.capture_mode, CaptureMode::Object);
         assert_eq!(settings.max_splats, 5_000_000);
         assert_eq!(settings.max_frames, 250);
+        assert_eq!(settings.extract_mode, ExtractMode::Density);
+        assert_eq!(settings.extract_quality, 55);
+    }
+
+    #[test]
+    fn sanitized_clamps_extract_quality() {
+        let low = PipelineSettings {
+            extract_quality: 0,
+            ..PipelineSettings::from_preset(Preset::Fast)
+        };
+        assert_eq!(low.sanitized().extract_quality, 1);
+        let high = PipelineSettings {
+            extract_quality: 200,
+            ..PipelineSettings::from_preset(Preset::Fast)
+        };
+        assert_eq!(high.sanitized().extract_quality, 100);
+    }
+
+    #[test]
+    fn presets_stay_on_density_extract() {
+        assert_eq!(
+            PipelineSettings::from_preset(Preset::Fast).extract_mode,
+            ExtractMode::Density
+        );
+        assert_eq!(
+            PipelineSettings::from_preset(Preset::Quality).extract_mode,
+            ExtractMode::Density
+        );
     }
 
     #[test]

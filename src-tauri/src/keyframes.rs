@@ -6,7 +6,7 @@ use image::GrayImage;
 
 use crate::error::PipelineError;
 use crate::project::{is_image, MIN_FRAMES};
-use crate::settings::PipelineSettings;
+use crate::settings::{ExtractMode, PipelineSettings};
 
 /// Laplacian variance below this is treated as mush (motion blur / defocus).
 pub const BLUR_FLOOR: f32 = 15.0;
@@ -16,6 +16,9 @@ const MODERATE_MAD: f32 = 8.0;
 
 const CANDIDATE_MIN_FPS: f32 = 8.0;
 const CANDIDATE_MAX_FPS: f32 = 12.0;
+const CHANGE_CANDIDATE_MAX_FPS: f32 = 24.0;
+const CHANGE_MAD_SPARSE: f32 = 96.0;
+const CHANGE_MAD_DENSE: f32 = 4.0;
 const THRESHOLD_RELAX_STEPS: u32 = 6;
 
 /// Per-candidate scores in extract order (FFmpeg `n` after the fps filter).
@@ -35,14 +38,22 @@ pub struct KeyframeConfig {
 }
 
 impl KeyframeConfig {
-    /// Maps pipeline knobs onto selector caps. `fps` is target density while moving.
+    /// Maps pipeline knobs onto selector caps. Density uses `fps`; Change uses extract quality.
     pub fn from_settings(settings: PipelineSettings) -> Self {
         let settings = settings.sanitized();
-        Self {
-            min_keep: MIN_FRAMES,
-            max_keep: settings.max_frames as usize,
-            motion_threshold: motion_threshold(settings.fps),
-            blur_floor: BLUR_FLOOR,
+        match settings.extract_mode {
+            ExtractMode::Change => Self {
+                min_keep: MIN_FRAMES,
+                max_keep: settings.capture_mode.max_frames_cap() as usize,
+                motion_threshold: change_motion_threshold(settings.extract_quality),
+                blur_floor: BLUR_FLOOR,
+            },
+            ExtractMode::Density => Self {
+                min_keep: MIN_FRAMES,
+                max_keep: settings.max_frames as usize,
+                motion_threshold: motion_threshold(settings.fps),
+                blur_floor: BLUR_FLOOR,
+            },
         }
     }
 }
@@ -52,10 +63,35 @@ pub fn candidate_fps(target_fps: f32) -> f32 {
     (target_fps * 4.0).clamp(CANDIDATE_MIN_FPS, CANDIDATE_MAX_FPS)
 }
 
+/// Candidate thumb rate for the active extract mode.
+pub fn candidate_fps_for(settings: PipelineSettings) -> f32 {
+    let settings = settings.sanitized();
+    match settings.extract_mode {
+        ExtractMode::Change => change_candidate_fps(settings.extract_quality),
+        ExtractMode::Density => candidate_fps(settings.fps),
+    }
+}
+
 /// Accumulated MAD that should yield about `target_fps` keeps under moderate motion.
 pub fn motion_threshold(target_fps: f32) -> f32 {
     let target = target_fps.max(0.25);
     (candidate_fps(target) / target) * MODERATE_MAD
+}
+
+/// Maps extract quality 1–100 onto the accumulated-MAD gate. 100 extracts sooner.
+pub fn change_motion_threshold(quality: u8) -> f32 {
+    let t = quality_unit(quality);
+    CHANGE_MAD_SPARSE + (CHANGE_MAD_DENSE - CHANGE_MAD_SPARSE) * t
+}
+
+/// Dense thumbs for Change mode: quality 1 stays at 8 fps, 100 goes to 24.
+pub fn change_candidate_fps(quality: u8) -> f32 {
+    let t = quality_unit(quality);
+    CANDIDATE_MIN_FPS + (CHANGE_CANDIDATE_MAX_FPS - CANDIDATE_MIN_FPS) * t
+}
+
+fn quality_unit(quality: u8) -> f32 {
+    f32::from(quality.clamp(1, 100) - 1) / 99.0
 }
 
 /// Picks keyframe indices from motion/sharpness scores. Never exceeds `max_keep`.
@@ -316,6 +352,8 @@ fn constant(len: usize, motion: f32, sharpness: f32) -> Vec<CandidateScore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preset::Preset;
+    use crate::settings::{CaptureMode, ExtractMode, PipelineSettings};
     use image::{GrayImage, Luma, Rgb, RgbImage};
     use tempfile::tempdir;
 
@@ -326,6 +364,14 @@ mod tests {
             motion_threshold,
             blur_floor: 10.0,
         }
+    }
+
+    fn change_settings(quality: u8) -> PipelineSettings {
+        let mut settings = PipelineSettings::from_preset(Preset::Fast);
+        settings.extract_mode = ExtractMode::Change;
+        settings.extract_quality = quality;
+        settings.max_frames = 40;
+        settings
     }
 
     #[test]
@@ -447,5 +493,74 @@ mod tests {
         let data = scores(&[0.0, 4.0], &[10.0, 20.0]);
         assert_eq!(data[1].motion, 4.0);
         assert_eq!(data[1].sharpness, 20.0);
+    }
+
+    #[test]
+    fn change_quality_maps_sparse_to_dense() {
+        assert!((change_motion_threshold(1) - 96.0).abs() < 0.01);
+        assert!((change_motion_threshold(100) - 4.0).abs() < 0.01);
+        assert!((change_candidate_fps(1) - 8.0).abs() < 0.01);
+        assert!((change_candidate_fps(100) - 24.0).abs() < 0.01);
+        assert!(change_motion_threshold(100) < change_motion_threshold(1));
+    }
+
+    #[test]
+    fn change_quality_100_keeps_more_than_quality_1() {
+        let data = constant(200, 16.0, 50.0);
+        let sparse = select_keyframes(&data, KeyframeConfig::from_settings(change_settings(1)));
+        let dense = select_keyframes(&data, KeyframeConfig::from_settings(change_settings(100)));
+        assert!(
+            dense.len() > sparse.len(),
+            "quality 100 should keep more, got {} vs {}",
+            dense.len(),
+            sparse.len()
+        );
+    }
+
+    #[test]
+    fn change_quality_does_not_densify_a_pause() {
+        let picked = select_keyframes(
+            &constant(80, 0.0, 50.0),
+            KeyframeConfig::from_settings(change_settings(100)),
+        );
+        assert_eq!(picked.len(), MIN_FRAMES);
+    }
+
+    #[test]
+    fn change_mode_ignores_max_frames_and_uses_capture_cap() {
+        let config = KeyframeConfig::from_settings(change_settings(100));
+        assert_eq!(
+            config.max_keep,
+            CaptureMode::Object.max_frames_cap() as usize
+        );
+        let picked = select_keyframes(&constant(200, 40.0, 50.0), config);
+        assert!(
+            picked.len() > 40,
+            "change mode must ignore settings.max_frames, got {}",
+            picked.len()
+        );
+        assert!(picked.len() <= config.max_keep);
+    }
+
+    #[test]
+    fn change_outdoor_cap_is_higher_than_object() {
+        let mut outdoor = change_settings(55);
+        outdoor.capture_mode = CaptureMode::Outdoor;
+        assert_eq!(
+            KeyframeConfig::from_settings(outdoor).max_keep,
+            CaptureMode::Outdoor.max_frames_cap() as usize
+        );
+    }
+
+    #[test]
+    fn candidate_fps_for_change_can_exceed_density_cap() {
+        assert_eq!(
+            candidate_fps_for(change_settings(100)),
+            CHANGE_CANDIDATE_MAX_FPS
+        );
+        assert_eq!(
+            candidate_fps_for(PipelineSettings::from_preset(Preset::Quality)),
+            12.0
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! Tauri IPC: pipeline, archive library, and app config.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -307,9 +308,15 @@ pub fn read_splat_file(path: String) -> Result<Response, String> {
     Ok(Response::new(read_splat_bytes(Path::new(&path))?))
 }
 
-/// Loads splat bytes from disk; empty and missing files fail with a stable message.
+/// Loads splat bytes from disk; empty, missing, and TCC-denied files fail with a stable message.
 fn read_splat_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    let bytes = fs::read(path).map_err(|err| format!("Cannot read splat: {err}"))?;
+    let bytes = fs::read(path).map_err(|err| {
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            PipelineError::from_io_path(err, path).to_string()
+        } else {
+            format!("Cannot read splat: {err}")
+        }
+    })?;
     if bytes.is_empty() {
         return Err("Cannot read splat: file is empty.".into());
     }
@@ -325,8 +332,8 @@ pub fn drop_archive_ply(app: AppHandle, id: String) -> Result<ArchiveEntry, Stri
     Ok(entry)
 }
 
-/// Loads config.json and creates the archive folder on the main thread (macOS TCC).
-fn load_config(app: &AppHandle) -> Result<AppConfig, String> {
+/// Loads config.json and creates the archive folder. Call from the macOS main thread (app setup) so TCC can prompt.
+pub(crate) fn load_config(app: &AppHandle) -> Result<AppConfig, String> {
     let dir = config_dir(app)?;
     let documents = app.path().document_dir().map_err(|err| err.to_string())?;
     let default_archive = app_config::default_archive_dir(&documents);
@@ -383,5 +390,26 @@ mod tests {
         let ply = dir.path().join("scene.ply");
         fs::write(&ply, b"ply\n").unwrap();
         assert_eq!(read_splat_bytes(&ply).unwrap(), b"ply\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_splat_bytes_names_permission_denied_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ply = dir.path().join("locked.ply");
+        fs::write(&ply, b"ply\n").unwrap();
+        let mut perms = fs::metadata(&ply).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&ply, perms).unwrap();
+
+        let err = read_splat_bytes(&ply).unwrap_err();
+        let mut perms = fs::metadata(&ply).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&ply, perms).unwrap();
+
+        assert!(err.contains("locked.ply"), "{err}");
+        assert!(err.contains("Files and Folders"), "{err}");
     }
 }

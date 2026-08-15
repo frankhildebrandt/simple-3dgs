@@ -25,6 +25,8 @@ export type TrainStats = {
 
 export type FrameFormat = "jpg" | "png";
 
+export type ExtractMode = "density" | "change";
+
 export type PipelineSettings = {
   fps: number;
   maxImageSize: number;
@@ -37,6 +39,8 @@ export type PipelineSettings = {
   captureMode: CaptureMode;
   maxSplats: number;
   maxFrames: number;
+  extractMode: ExtractMode;
+  extractQuality: number;
 };
 
 export type PipelineRequest = {
@@ -103,6 +107,8 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     captureMode: "object",
     maxSplats: 2_000_000,
     maxFrames: 120,
+    extractMode: "density",
+    extractQuality: 55,
   },
   balanced: {
     fps: 2,
@@ -116,6 +122,8 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     captureMode: "object",
     maxSplats: 5_000_000,
     maxFrames: 250,
+    extractMode: "density",
+    extractQuality: 55,
   },
   quality: {
     fps: 4,
@@ -129,6 +137,8 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     captureMode: "object",
     maxSplats: 10_000_000,
     maxFrames: 500,
+    extractMode: "density",
+    extractQuality: 55,
   },
 };
 
@@ -139,6 +149,9 @@ export function maxFramesCap(mode: CaptureMode): number {
 
 /** Returns the named preset when core knobs still match, ignoring clip trim. */
 export function matchingPreset(settings: PipelineSettings): Preset | null {
+  if (settings.extractMode === "change") {
+    return null;
+  }
   for (const id of ["fast", "balanced", "quality"] as const) {
     const preset = PRESET_SETTINGS[id];
     if (
