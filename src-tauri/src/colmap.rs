@@ -1,6 +1,9 @@
 //! COLMAP SfM command sequence. Sequential matching for orbits and long paths;
 //! exhaustive matching for room captures so loops can close (up to 250 frames).
 //! Longer rooms fall back to sequential matching with quadratic overlap.
+//! After matching, Room copies the database and runs `view_graph_calibrator`
+//! then `global_mapper` (COLMAP 4 global SfM, formerly GLOMAP). Object and
+//! Outdoor stay on incremental `mapper`.
 //! Flags match COLMAP 4 (`FeatureExtraction` / `FeatureMatching`, not the old `SiftExtraction.use_gpu`).
 
 use std::path::Path;
@@ -12,20 +15,31 @@ const CAMERA_MODEL: &str = "SIMPLE_RADIAL";
 const EXHAUSTIVE_FRAME_LIMIT: usize = 250;
 const SCENE_MIN_OVERLAP: u32 = 20;
 
-/// Feature extraction, matching, then incremental mapping.
+/// Feature extraction, matching, then Room global SfM or incremental mapping.
+///
+/// `database` is used by extractor and matcher. Room mapping uses
+/// `global_database` (a copy the pipeline makes after matching).
 pub fn reconstruction_specs(
     image_dir: &Path,
     database: &Path,
     sparse_dir: &Path,
     settings: PipelineSettings,
     frame_count: usize,
+    global_database: &Path,
 ) -> Vec<CommandSpec> {
     let settings = settings.sanitized();
-    vec![
-        feature_extractor_spec(image_dir, database, settings).capture(settings.capture_mode),
-        matcher_spec(database, settings, frame_count).capture(settings.capture_mode),
-        mapper_spec(image_dir, database, sparse_dir, settings).capture(settings.capture_mode),
-    ]
+    let mode = settings.capture_mode;
+    let mut specs = vec![
+        feature_extractor_spec(image_dir, database, settings).capture(mode),
+        matcher_spec(database, settings, frame_count).capture(mode),
+    ];
+    if mode == CaptureMode::Room {
+        specs.push(view_graph_calibrator_spec(global_database).capture(mode));
+        specs.push(global_mapper_spec(image_dir, global_database, sparse_dir).capture(mode));
+    } else {
+        specs.push(mapper_spec(image_dir, database, sparse_dir, settings).capture(mode));
+    }
+    specs
 }
 
 pub fn feature_extractor_spec(
@@ -122,6 +136,34 @@ pub fn mapper_spec(
     CommandSpec::new("colmap", args)
 }
 
+/// Calibrates camera intrinsics in-place; callers must pass a database copy.
+pub fn view_graph_calibrator_spec(database: &Path) -> CommandSpec {
+    CommandSpec::new(
+        "colmap",
+        vec![
+            "view_graph_calibrator".into(),
+            "--database_path".into(),
+            path_arg(database),
+        ],
+    )
+}
+
+/// Global SfM via COLMAP 4 `global_mapper` (formerly GLOMAP).
+pub fn global_mapper_spec(image_dir: &Path, database: &Path, sparse_dir: &Path) -> CommandSpec {
+    CommandSpec::new(
+        "colmap",
+        vec![
+            "global_mapper".into(),
+            "--database_path".into(),
+            path_arg(database),
+            "--image_path".into(),
+            path_arg(image_dir),
+            "--output_path".into(),
+            path_arg(sparse_dir),
+        ],
+    )
+}
+
 fn uses_exhaustive(mode: CaptureMode, frame_count: usize) -> bool {
     mode == CaptureMode::Room && frame_count <= EXHAUSTIVE_FRAME_LIMIT
 }
@@ -163,20 +205,103 @@ mod tests {
         settings
     }
 
-    #[test]
-    fn sequence_is_extractor_matcher_mapper() {
-        let specs = reconstruction_specs(
+    fn colmap_specs(settings: PipelineSettings, frame_count: usize) -> Vec<CommandSpec> {
+        reconstruction_specs(
             Path::new("frames"),
             Path::new("colmap/database.db"),
             Path::new("colmap/sparse"),
-            object_settings(),
-            40,
-        );
+            settings,
+            frame_count,
+            Path::new("colmap/database_global.db"),
+        )
+    }
+
+    fn subcommand(spec: &CommandSpec) -> &str {
+        spec.args[0].as_str()
+    }
+
+    fn uses_database(spec: &CommandSpec, database: &str) -> bool {
+        spec.args
+            .windows(2)
+            .any(|w| w[0] == "--database_path" && w[1] == database)
+    }
+
+    #[test]
+    fn object_sequence_is_extractor_matcher_mapper() {
+        let specs = colmap_specs(object_settings(), 40);
         assert_eq!(specs.len(), 3);
-        assert_eq!(specs[0].args[0], "feature_extractor");
-        assert_eq!(specs[1].args[0], "sequential_matcher");
-        assert_eq!(specs[2].args[0], "mapper");
+        assert_eq!(subcommand(&specs[0]), "feature_extractor");
+        assert_eq!(subcommand(&specs[1]), "sequential_matcher");
+        assert_eq!(subcommand(&specs[2]), "mapper");
         assert!(specs.iter().all(|s| s.sidecar == "colmap"));
+    }
+
+    #[test]
+    fn room_few_frames_uses_exhaustive_then_global_mapper() {
+        let specs = colmap_specs(room_settings(), 40);
+        assert_eq!(specs.len(), 4);
+        assert_eq!(subcommand(&specs[0]), "feature_extractor");
+        assert_eq!(subcommand(&specs[1]), "exhaustive_matcher");
+        assert_eq!(subcommand(&specs[2]), "view_graph_calibrator");
+        assert_eq!(subcommand(&specs[3]), "global_mapper");
+        assert!(specs.iter().all(|s| subcommand(s) != "mapper"));
+        assert!(uses_database(&specs[0], "colmap/database.db"));
+        assert!(uses_database(&specs[1], "colmap/database.db"));
+        assert!(uses_database(&specs[2], "colmap/database_global.db"));
+        assert!(uses_database(&specs[3], "colmap/database_global.db"));
+    }
+
+    #[test]
+    fn outdoor_sequence_keeps_incremental_mapper() {
+        let specs = colmap_specs(outdoor_settings(), 40);
+        assert_eq!(specs.len(), 3);
+        assert_eq!(subcommand(&specs[0]), "feature_extractor");
+        assert_eq!(subcommand(&specs[1]), "sequential_matcher");
+        assert_eq!(subcommand(&specs[2]), "mapper");
+        assert!(specs[2]
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--Mapper.init_min_tri_angle" && w[1] == "8"));
+    }
+
+    #[test]
+    fn room_many_frames_uses_sequential_then_global_mapper() {
+        let mut settings = room_settings();
+        settings.match_overlap = 15;
+        let specs = colmap_specs(settings, 300);
+        assert_eq!(subcommand(&specs[1]), "sequential_matcher");
+        assert!(specs[1]
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--SequentialMatching.overlap" && w[1] == "20"));
+        assert!(specs[1]
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--SequentialMatching.quadratic_overlap" && w[1] == "1"));
+        assert_eq!(subcommand(&specs[2]), "view_graph_calibrator");
+        assert_eq!(subcommand(&specs[3]), "global_mapper");
+        assert!(specs.iter().all(|s| subcommand(s) != "mapper"));
+    }
+
+    #[test]
+    fn global_mapper_only_passes_documented_paths() {
+        let spec = global_mapper_spec(
+            Path::new("frames"),
+            Path::new("colmap/database_global.db"),
+            Path::new("colmap/sparse"),
+        );
+        assert_eq!(
+            spec.args,
+            [
+                "global_mapper",
+                "--database_path",
+                "colmap/database_global.db",
+                "--image_path",
+                "frames",
+                "--output_path",
+                "colmap/sparse",
+            ]
+        );
     }
 
     #[test]

@@ -57,6 +57,11 @@ impl ProjectLayout {
         self.colmap_dir().join("database.db")
     }
 
+    /// Room global SfM copy of `database.db`; calibrator writes in-place here.
+    pub fn database_global_path(&self) -> PathBuf {
+        self.colmap_dir().join("database_global.db")
+    }
+
     pub fn sparse_dir(&self) -> PathBuf {
         self.colmap_dir().join("sparse")
     }
@@ -157,10 +162,7 @@ impl ProjectLayout {
             Stage::Frames => {
                 remove_dir_contents(&self.frames_dir())?;
                 remove_dir_contents(&self.dataset_dir())?;
-                let db = self.database_path();
-                if db.exists() {
-                    fs::remove_file(db)?;
-                }
+                self.remove_databases()?;
                 remove_dir_contents(&self.sparse_dir())?;
                 let ply = self.output_ply();
                 if ply.exists() {
@@ -168,10 +170,7 @@ impl ProjectLayout {
                 }
             }
             Stage::Colmap => {
-                let db = self.database_path();
-                if db.exists() {
-                    fs::remove_file(db)?;
-                }
+                self.remove_databases()?;
                 remove_dir_contents(&self.sparse_dir())?;
                 remove_dir_contents(&self.dataset_dir())?;
                 let ply = self.output_ply();
@@ -184,6 +183,16 @@ impl ProjectLayout {
                 if ply.exists() {
                     fs::remove_file(ply)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes both the matching database and the Room global-SfM copy.
+    fn remove_databases(&self) -> Result<(), PipelineError> {
+        for db in [self.database_path(), self.database_global_path()] {
+            if db.exists() {
+                fs::remove_file(db)?;
             }
         }
         Ok(())

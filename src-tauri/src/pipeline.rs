@@ -246,14 +246,14 @@ fn run_colmap(
         &layout.sparse_dir(),
         settings,
         frame_count,
+        &layout.database_global_path(),
     );
-    let labels = [
-        (20, "Extracting features"),
-        (50, "Matching views"),
-        (80, "Mapping cameras"),
-    ];
-    for (spec, (percent, message)) in specs.iter().zip(labels) {
+    for spec in &specs {
         cancel.check()?;
+        if is_view_graph_calibrator(spec) {
+            copy_database_for_global(layout)?;
+        }
+        let (percent, message) = colmap_progress(spec);
         events.progress(Stage::Colmap, percent, message);
         run_logged(runner, spec, events)?;
     }
@@ -268,6 +268,34 @@ fn run_colmap(
     assemble_dataset(layout)?;
     layout.mark_complete(Stage::Colmap)?;
     events.progress(Stage::Colmap, 100, "Sparse reconstruction ready");
+    Ok(())
+}
+
+fn is_view_graph_calibrator(spec: &CommandSpec) -> bool {
+    spec.args.first().map(String::as_str) == Some("view_graph_calibrator")
+}
+
+/// Progress percent and label from the COLMAP subcommand in `args[0]`.
+fn colmap_progress(spec: &CommandSpec) -> (u8, &'static str) {
+    match spec.args.first().map(String::as_str) {
+        Some("feature_extractor") => (20, "Extracting features"),
+        Some("sequential_matcher" | "exhaustive_matcher") => (50, "Matching views"),
+        Some("view_graph_calibrator") => (70, "Calibrating cameras"),
+        Some("mapper" | "global_mapper") => (85, "Mapping cameras"),
+        _ => (10, "Estimating camera poses"),
+    }
+}
+
+/// Copies `database.db` to `database_global.db` so the calibrator never mutates the original.
+fn copy_database_for_global(layout: &ProjectLayout) -> Result<(), PipelineError> {
+    let src = layout.database_path();
+    let dest = layout.database_global_path();
+    if !src.is_file() {
+        return Err(PipelineError::message(
+            "COLMAP database is missing after matching; cannot calibrate for Room mapping.",
+        ));
+    }
+    fs::copy(src, dest)?;
     Ok(())
 }
 
@@ -550,6 +578,49 @@ mod tests {
         run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
         assert!(runner.calls.iter().all(|c| c.sidecar != "ffmpeg"));
         assert_eq!(runner.calls[0].sidecar, "colmap");
+    }
+
+    #[test]
+    fn room_pipeline_runs_global_mapper() {
+        let dir = tempdir().unwrap();
+        let images = dir.path().join("photos");
+        fs::create_dir_all(&images).unwrap();
+        for i in 0..8 {
+            fs::write(images.join(format!("{i:02}.png")), b"img").unwrap();
+        }
+        let mut settings = PipelineSettings::from_preset(Preset::Fast);
+        settings.capture_mode = crate::settings::CaptureMode::Room;
+        let mut config = cfg(dir.path(), images, InputKind::Images);
+        config.settings = settings;
+        let mut runner = FakeRunner::new();
+        let mut events = CollectingEvents::new();
+        run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
+        let commands: Vec<_> = runner
+            .calls
+            .iter()
+            .filter(|c| c.sidecar == "colmap")
+            .map(|c| c.args[0].as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "feature_extractor",
+                "exhaustive_matcher",
+                "view_graph_calibrator",
+                "global_mapper"
+            ]
+        );
+        let layout = ProjectLayout::new(config.project_dir.as_ref().unwrap());
+        assert!(layout.sparse_model_dir().join("images.bin").is_file());
+        assert!(layout.database_global_path().is_file());
+        assert!(events
+            .progress
+            .iter()
+            .any(|(_, _, msg)| msg == "Calibrating cameras"));
+        assert!(events
+            .progress
+            .iter()
+            .any(|(_, _, msg)| msg == "Mapping cameras"));
     }
 
     #[test]

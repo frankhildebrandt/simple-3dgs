@@ -354,8 +354,21 @@ fn write_fake_frames(spec: &CommandSpec) -> Result<(), PipelineError> {
 
 #[cfg(test)]
 fn write_fake_colmap(spec: &CommandSpec) -> Result<(), PipelineError> {
-    if spec.args.first().map(String::as_str) != Some("mapper") {
-        return Ok(());
+    match spec.args.first().map(String::as_str) {
+        Some("feature_extractor") | Some("sequential_matcher") | Some("exhaustive_matcher") => {
+            if let Some(db) = arg_value(&spec.args, "--database_path") {
+                let path = Path::new(db);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if !path.is_file() {
+                    std::fs::write(path, b"fake-colmap-db")?;
+                }
+            }
+            return Ok(());
+        }
+        Some("mapper") | Some("global_mapper") => {}
+        _ => return Ok(()),
     }
     let output = arg_value(&spec.args, "--output_path")
         .ok_or_else(|| PipelineError::message("mapper missing --output_path"))?;
