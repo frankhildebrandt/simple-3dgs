@@ -1,17 +1,30 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { SplatFileType, transcodeSpz } from "@sparkjsdev/spark";
+import { readSplatFile } from "./api";
 
 export type SpzTranscode = typeof transcodeSpz;
 
-/** Loads a local PLY through Tauri's asset protocol. */
-export async function loadPlyBytes(plyPath: string): Promise<Uint8Array> {
-  const response = await fetch(convertFileSrc(plyPath));
-  if (!response.ok) {
-    throw new Error("Cannot encode SPZ: scene.ply is missing.");
+/** Turns a Tauri IPC payload into splat bytes. */
+export function splatBytesFromInvoke(data: unknown): Uint8Array {
+  if (data instanceof Uint8Array) {
+    return data;
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (Array.isArray(data)) {
+    return Uint8Array.from(data);
+  }
+  throw new Error("Cannot read splat: unexpected payload.");
+}
+
+/** Loads a local PLY or SPZ through Tauri IPC, not the asset protocol. */
+export async function loadPlyBytes(plyPath: string): Promise<Uint8Array> {
+  const bytes = splatBytesFromInvoke(await readSplatFile(plyPath));
   if (bytes.byteLength === 0) {
-    throw new Error("Cannot encode SPZ: scene.ply is empty.");
+    throw new Error("Cannot read splat: file is empty.");
   }
   return bytes;
 }

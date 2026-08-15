@@ -47,9 +47,23 @@ body,
 }
 
 .shell-body {
+  position: relative;
   min-height: 0;
   height: 100%;
   overflow: hidden;
+}
+
+.config-error {
+  position: absolute;
+  z-index: 4;
+  left: 1rem;
+  right: 1rem;
+  top: 0.75rem;
+  margin: 0;
+  padding: 0.65rem 0.8rem;
+  background: var(--panel);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
 }
 
 .shell-body > .shell-page,

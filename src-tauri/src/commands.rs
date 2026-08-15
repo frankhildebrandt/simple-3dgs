@@ -1,5 +1,6 @@
 //! Tauri IPC: pipeline, archive library, and app config.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -16,7 +17,7 @@ use crate::settings::PipelineSettings;
 use crate::sidecar::{CancelFlag, ProcessRunner};
 use crate::train_log::TrainSnapshot;
 use base64::Engine;
-use tauri::ipc::{InvokeBody, Request};
+use tauri::ipc::{InvokeBody, Request, Response};
 
 pub struct AppState {
     pub cancel: CancelFlag,
@@ -188,7 +189,8 @@ pub fn save_config(app: AppHandle, mut config: AppConfig) -> Result<AppConfig, S
         return Err("Choose an archive folder.".into());
     }
     let archive = PathBuf::from(&config.archive_dir);
-    std::fs::create_dir_all(&archive).map_err(|err| err.to_string())?;
+    std::fs::create_dir_all(&archive)
+        .map_err(|err| PipelineError::from_io_path(err, &archive).to_string())?;
     if !config.temp_project {
         let project = config.project_dir.as_deref().unwrap_or("").trim();
         if project.is_empty() {
@@ -299,6 +301,21 @@ pub fn export_spz(app: AppHandle, id: String, dest_path: String) -> Result<(), S
         .map_err(|err| err.to_string())
 }
 
+/// Reads a local PLY or SPZ as a raw IPC body so the viewer can skip `asset:` fetch.
+#[tauri::command]
+pub fn read_splat_file(path: String) -> Result<Response, String> {
+    Ok(Response::new(read_splat_bytes(Path::new(&path))?))
+}
+
+/// Loads splat bytes from disk; empty and missing files fail with a stable message.
+fn read_splat_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let bytes = fs::read(path).map_err(|err| format!("Cannot read splat: {err}"))?;
+    if bytes.is_empty() {
+        return Err("Cannot read splat: file is empty.".into());
+    }
+    Ok(bytes)
+}
+
 #[tauri::command]
 pub fn drop_archive_ply(app: AppHandle, id: String) -> Result<ArchiveEntry, String> {
     let entry = library(&app)?
@@ -308,10 +325,27 @@ pub fn drop_archive_ply(app: AppHandle, id: String) -> Result<ArchiveEntry, Stri
     Ok(entry)
 }
 
+/// Loads config.json and creates the archive folder on the main thread (macOS TCC).
 fn load_config(app: &AppHandle) -> Result<AppConfig, String> {
+    let dir = config_dir(app)?;
     let documents = app.path().document_dir().map_err(|err| err.to_string())?;
     let default_archive = app_config::default_archive_dir(&documents);
-    app_config::load_or_init(&config_dir(app)?, &default_archive).map_err(|err| err.to_string())
+    let mut config =
+        app_config::load_or_init(&dir, &default_archive).map_err(|err| err.to_string())?;
+    let fallback = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| err.to_string())?
+        .join("archive");
+    // Touch the archive on the main thread so macOS can show a TCC prompt.
+    let resolved = app_config::resolve_archive_dir(Path::new(&config.archive_dir), &fallback)
+        .map_err(|err| err.to_string())?;
+    let resolved_str = resolved.to_string_lossy().into_owned();
+    if config.archive_dir != resolved_str {
+        config.archive_dir = resolved_str;
+        app_config::save(&dir, &config).map_err(|err| err.to_string())?;
+    }
+    Ok(config)
 }
 
 fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -325,4 +359,29 @@ fn library(app: &AppHandle) -> Result<ArchiveLibrary, String> {
 
 fn emit_archive_changed(app: &AppHandle, id: &str) {
     let _ = app.emit("archive-changed", id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_splat_bytes_rejects_missing_and_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.ply");
+        assert!(read_splat_bytes(&missing)
+            .unwrap_err()
+            .starts_with("Cannot read splat:"));
+
+        let empty = dir.path().join("empty.ply");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            read_splat_bytes(&empty).unwrap_err(),
+            "Cannot read splat: file is empty."
+        );
+
+        let ply = dir.path().join("scene.ply");
+        fs::write(&ply, b"ply\n").unwrap();
+        assert_eq!(read_splat_bytes(&ply).unwrap(), b"ply\n");
+    }
 }

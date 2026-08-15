@@ -87,6 +87,18 @@ pub fn default_archive_dir(documents: &Path) -> PathBuf {
     documents.join("Simple 3DGS").join("archive")
 }
 
+/// Creates `preferred`. On TCC/EPERM, creates `fallback` instead so the app still starts.
+pub fn resolve_archive_dir(preferred: &Path, fallback: &Path) -> Result<PathBuf, PipelineError> {
+    match fs::create_dir_all(preferred) {
+        Ok(()) => Ok(preferred.to_path_buf()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            fs::create_dir_all(fallback)?;
+            Ok(fallback.to_path_buf())
+        }
+        Err(err) => Err(PipelineError::from_io_path(err, preferred)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +172,39 @@ mod tests {
             path,
             Path::new("/Users/frank/Documents/Simple 3DGS/archive")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_archive_falls_back_when_preferred_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        let preferred = locked.join("archive");
+        let fallback = dir.path().join("fallback");
+        let resolved = resolve_archive_dir(&preferred, &fallback).unwrap();
+        assert_eq!(resolved, fallback);
+        assert!(fallback.is_dir());
+
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&locked, perms).unwrap();
+    }
+
+    #[test]
+    fn resolve_archive_keeps_writable_preferred() {
+        let dir = tempdir().unwrap();
+        let preferred = dir.path().join("documents").join("archive");
+        let fallback = dir.path().join("fallback");
+        let resolved = resolve_archive_dir(&preferred, &fallback).unwrap();
+        assert_eq!(resolved, preferred);
+        assert!(preferred.is_dir());
+        assert!(!fallback.exists());
     }
 }

@@ -9,6 +9,7 @@ import {
   ROOM_MIN_ALPHA,
   SPARK_MIN_ALPHA,
   sparkTuning,
+  splatLoadFlags,
   viewerProfile,
 } from "./viewerProfile";
 
@@ -70,5 +71,27 @@ describe("sparkTuning", () => {
     expect(tuning.minSortIntervalMs).toBe(MIN_SORT_INTERVAL_MS);
     expect(tuning.maxStdDev).toBe(OUTDOOR_MAX_STD_DEV);
     expect(tuning.clipXY).toBe(1.1);
+  });
+});
+
+describe("splatLoadFlags", () => {
+  it("keeps packed originals and drives LoD after training", () => {
+    const flags = splatLoadFlags(viewerProfile("object"));
+    expect(flags).toEqual({
+      lod: true,
+      nonLod: true,
+      lodAbove: LOD_ABOVE,
+      enableLod: true,
+      raycastable: false,
+    });
+  });
+
+  it("keeps packed originals and skips LoD drive during a live preview", () => {
+    const flags = splatLoadFlags(viewerProfile("object", true), true);
+    expect(flags.lod).toBe(true);
+    expect(flags.nonLod).toBe(true);
+    expect(flags.lodAbove).toBe(LIVE_LOD_ABOVE);
+    expect(flags.enableLod).toBe(false);
+    expect(flags.raycastable).toBe(false);
   });
 });

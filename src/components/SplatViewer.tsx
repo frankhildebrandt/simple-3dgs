@@ -15,7 +15,7 @@ import {
   viewerModeLabel,
   type ViewerMode,
 } from "../viewerMode";
-import { sparkTuning, viewerProfile } from "../viewerProfile";
+import { sparkTuning, splatLoadFlags, viewerProfile } from "../viewerProfile";
 import {
   viewerPixelRatio,
   viewerScaleForSession,
@@ -154,6 +154,7 @@ export function SplatViewer({
   const [previewBusy, setPreviewBusy] = useState(false);
   const [scale, setScale] = useState<ViewerScale>("fast");
   const [viewMode, setViewMode] = useState<ViewerMode>("splats");
+  const [loadError, setLoadError] = useState<string | null>(null);
   const liveRef = useRef(!!live);
   liveRef.current = !!live;
   const scaleRef = useRef(scale);
@@ -234,7 +235,7 @@ export function SplatViewer({
     const spark = new SparkRenderer({
       renderer,
       ...sparkTuning(profile),
-      enableLod: !liveRef.current,
+      enableLod: true,
     });
     applyViewerMode(spark, viewModeRef.current, profile);
     scene.add(spark);
@@ -358,6 +359,7 @@ export function SplatViewer({
     }
     pendingPathRef.current = plyPath;
     if (!plyPath) {
+      setLoadError(null);
       return;
     }
     void loadLatest();
@@ -386,9 +388,7 @@ export function SplatViewer({
           fileBytes: bytes,
           fileType: kind === "spz" ? SplatFileType.SPZ : SplatFileType.PLY,
           fileName: splatFileName(path),
-          lod: profile.lod,
-          lodAbove: profile.lodAbove,
-          raycastable: false,
+          ...splatLoadFlags(profile, liveRef.current),
         });
         next.quaternion.set(1, 0, 0, 0);
         world.scene.add(next);
@@ -411,16 +411,19 @@ export function SplatViewer({
         frameSplat(world.camera, world.controls, mesh, modeRef.current, view);
         world.framed = true;
         setFramed(true);
+        setLoadError(null);
         if (previous && previous !== mesh) {
           dropSplat(previous);
         }
-      } catch {
+      } catch (err) {
         if (next && worldRef.current?.splat !== next) {
           dropSplat(next);
         }
         if (pendingPathRef.current === path) {
           pendingPathRef.current = shownPathRef.current;
         }
+        console.error("Checkpoint failed to load", path, err);
+        setLoadError("Checkpoint failed to load");
       } finally {
         loadingRef.current = false;
         if (worldRef.current === world && pendingPathRef.current !== shownPathRef.current) {
@@ -438,7 +441,6 @@ export function SplatViewer({
     }
     const profile = viewerProfile(captureMode, live);
     Object.assign(world.spark, sparkTuning(profile));
-    world.spark.enableLod = !live;
     applyViewerMode(world.spark, viewModeRef.current, profile);
     void mesh.initialized.then((readyMesh) => {
       if (worldRef.current?.splat !== readyMesh) {
@@ -469,9 +471,11 @@ export function SplatViewer({
     applyViewerMode(world.spark, viewMode, viewerProfile(modeRef.current, liveRef.current));
   }, [ready, viewMode]);
 
-  const hint = live
-    ? "Live preview — Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster"
-    : "Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster";
+  const hint = loadError
+    ? loadError
+    : live
+      ? "Live preview — Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster"
+      : "Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster";
 
   return (
     <div className="viewer" ref={hostRef}>

@@ -65,3 +65,8 @@ export function exportSpz(id: string, destPath: string): Promise<void> {
 export function dropArchivePly(id: string): Promise<ArchiveEntry> {
   return invoke<ArchiveEntry>("drop_archive_ply", { id });
 }
+
+/** Reads a local PLY or SPZ as a raw IPC body. */
+export function readSplatFile(path: string): Promise<unknown> {
+  return invoke("read_splat_file", { path });
+}

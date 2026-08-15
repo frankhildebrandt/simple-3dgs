@@ -5,7 +5,24 @@ vi.mock("@sparkjsdev/spark", () => ({
   transcodeSpz: vi.fn(),
 }));
 
-import { plyBytesToSpz } from "./spzTranscode";
+vi.mock("./api", () => ({
+  readSplatFile: vi.fn(),
+}));
+
+import { plyBytesToSpz, splatBytesFromInvoke } from "./spzTranscode";
+
+describe("splatBytesFromInvoke", () => {
+  it("accepts Uint8Array, ArrayBuffer, and number arrays", () => {
+    expect(splatBytesFromInvoke(new Uint8Array([1, 2]))).toEqual(new Uint8Array([1, 2]));
+    expect(splatBytesFromInvoke(new Uint8Array([3, 4]).buffer)).toEqual(new Uint8Array([3, 4]));
+    expect(splatBytesFromInvoke([5, 6])).toEqual(new Uint8Array([5, 6]));
+  });
+
+  it("rejects anything that is not splat bytes", () => {
+    expect(() => splatBytesFromInvoke(null)).toThrow("Cannot read splat: unexpected payload.");
+    expect(() => splatBytesFromInvoke("ply")).toThrow("Cannot read splat: unexpected payload.");
+  });
+});
 
 describe("plyBytesToSpz", () => {
   it("rejects an empty PLY before calling Spark", async () => {

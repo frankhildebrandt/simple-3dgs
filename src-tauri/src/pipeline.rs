@@ -452,7 +452,7 @@ fn copy_input_video(source: &Path, input_dir: &Path) -> Result<PathBuf, Pipeline
             .ok_or_else(|| PipelineError::message("video path is missing a file name"))?,
     );
     if source.canonicalize().ok() != dest.canonicalize().ok() {
-        fs::copy(source, &dest)?;
+        fs::copy(source, &dest).map_err(|err| PipelineError::from_io_path(err, source))?;
     }
     Ok(dest)
 }
@@ -466,7 +466,7 @@ fn import_image_folder(source: &Path, frames_dir: &Path) -> Result<(), PipelineE
     }
     fs::create_dir_all(frames_dir)?;
     let mut copied = 0;
-    for entry in fs::read_dir(source)? {
+    for entry in fs::read_dir(source).map_err(|err| PipelineError::from_io_path(err, source))? {
         let src = entry?.path();
         if src.is_file() && crate::project::is_image(&src) {
             let dest = frames_dir.join(src.file_name().unwrap());

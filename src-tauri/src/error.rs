@@ -1,6 +1,7 @@
 //! User-facing pipeline errors. Sidecar failures include a recovery hint.
 
 use std::io;
+use std::path::Path;
 
 use crate::settings::CaptureMode;
 
@@ -60,6 +61,18 @@ impl PipelineError {
             hint: "Training stopped early. Check GPU/Metal availability and free memory (16 GB RAM minimum).".into(),
         }
     }
+
+    /// Attaches `path` when macOS TCC denies Documents/Desktop/Downloads.
+    pub fn from_io_path(err: io::Error, path: &Path) -> Self {
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            Self::Message(format!(
+                "macOS blocked access to {}. Allow Simple 3DGS in System Settings → Privacy & Security → Files and Folders, or choose a different folder.",
+                path.display()
+            ))
+        } else {
+            Self::Io(err)
+        }
+    }
 }
 
 /// Capture-mode-specific advice when SfM cannot recover poses.
@@ -90,6 +103,7 @@ fn last_useful_line(log: &str) -> String {
 mod tests {
     use super::PipelineError;
     use crate::settings::CaptureMode;
+    use std::io;
 
     #[test]
     fn colmap_flag_errors_are_not_blamed_on_capture() {
@@ -116,5 +130,26 @@ mod tests {
         let msg = PipelineError::colmap_failed_with(1, "", CaptureMode::Outdoor).to_string();
         assert!(msg.contains("sky"));
         assert!(!msg.to_lowercase().contains("orbit"));
+    }
+
+    #[test]
+    fn permission_denied_names_the_path_and_privacy_settings() {
+        let err = PipelineError::from_io_path(
+            io::Error::from_raw_os_error(1),
+            std::path::Path::new("/Users/frank/Documents/Simple 3DGS/archive"),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Documents/Simple 3DGS/archive"));
+        assert!(msg.contains("Files and Folders"));
+        assert!(!msg.contains("I/O error"));
+    }
+
+    #[test]
+    fn other_io_errors_keep_the_generic_prefix() {
+        let err = PipelineError::from_io_path(
+            io::Error::from_raw_os_error(2),
+            std::path::Path::new("/missing"),
+        );
+        assert!(err.to_string().starts_with("I/O error:"));
     }
 }

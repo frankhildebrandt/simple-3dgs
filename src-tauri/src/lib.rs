@@ -41,6 +41,7 @@ pub fn run() {
             commands::spz_cache_fresh,
             commands::cache_archive_spz,
             commands::export_spz,
+            commands::read_splat_file,
             commands::drop_archive_ply,
         ])
         .run(tauri::generate_context!())

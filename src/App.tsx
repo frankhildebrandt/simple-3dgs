@@ -23,18 +23,23 @@ function Shell() {
   const [density, setDensity] = useState<"easy" | "expert">("easy");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
 
   useEffect(() => {
     void getConfig()
       .then((loaded) => {
         setConfig(loaded);
+        setConfigError(null);
         setView(loaded.uiMode);
         if (loaded.uiMode === "easy" || loaded.uiMode === "expert") {
           setDensity(loaded.uiMode);
         }
       })
-      .catch(() => setConfig(null));
+      .catch((err: unknown) => {
+        setConfig(null);
+        setConfigError(err instanceof Error ? err.message : String(err));
+      });
   }, []);
 
   useEffect(() => {
@@ -79,6 +84,7 @@ function Shell() {
         onSettings={() => setSettingsOpen((open) => !open)}
       />
       <div className="shell-body">
+        {configError ? <p className="archive-error config-error">{configError}</p> : null}
         <div className="shell-page" hidden={settingsOpen || !reconstruct}>
           <ReconstructView
             config={config}

@@ -625,7 +625,9 @@ mod tests {
             }),
         );
         assert!(html.contains("camera.position.set(1.00000000, 2.00000000, 3.00000000)"));
-        assert!(html.contains("camera.quaternion.set(0.00000000, 0.00000000, 0.00000000, 1.00000000)"));
+        assert!(
+            html.contains("camera.quaternion.set(0.00000000, 0.00000000, 0.00000000, 1.00000000)")
+        );
         assert!(!html.contains("controls.target"));
     }
 }

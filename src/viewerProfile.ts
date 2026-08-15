@@ -35,6 +35,15 @@ export type SparkTuning = {
   minSortIntervalMs: number;
 };
 
+/** SplatMesh decode flags. nonLod keeps packed originals; live skips LoD drive. */
+export type SplatLoadFlags = {
+  lod: true;
+  nonLod: true;
+  lodAbove: number;
+  enableLod: boolean;
+  raycastable: false;
+};
+
 /**
  * View-dependent splat budget for Spark. LoD drops off-axis and behind-camera
  * splats; rooms raise minAlpha so faint floaters do not show through walls.
@@ -94,5 +103,19 @@ export function sparkTuning(profile: ViewerProfile): SparkTuning {
     clipXY: profile.clipXY,
     minPixelRadius: MIN_PIXEL_RADIUS,
     minSortIntervalMs: MIN_SORT_INTERVAL_MS,
+  };
+}
+
+/**
+ * SplatMesh decode flags matching the HTML export. nonLod keeps packed
+ * originals so live previews stay visible when the renderer is not driving LoD.
+ */
+export function splatLoadFlags(profile: ViewerProfile, live = false): SplatLoadFlags {
+  return {
+    lod: true,
+    nonLod: true,
+    lodAbove: profile.lodAbove,
+    enableLod: !live,
+    raycastable: false,
   };
 }

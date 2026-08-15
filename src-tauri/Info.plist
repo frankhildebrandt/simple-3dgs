@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Simple 3DGS stores reconstructions in your Documents folder.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Simple 3DGS reads videos and photos you drop from Downloads.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Simple 3DGS reads videos and photos you drop from the Desktop.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Simple 3DGS reads videos and photos from cameras and external drives.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Simple 3DGS can store or read reconstructions on a network volume.</string>
+</dict>
+</plist>

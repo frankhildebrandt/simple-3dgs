@@ -80,8 +80,9 @@ pub struct IngestRequest<'a> {
 impl ArchiveLibrary {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, PipelineError> {
         let root = root.into();
-        fs::create_dir_all(&root)?;
-        fs::create_dir_all(root.join(SCRATCH_DIR))?;
+        fs::create_dir_all(&root).map_err(|err| PipelineError::from_io_path(err, &root))?;
+        fs::create_dir_all(root.join(SCRATCH_DIR))
+            .map_err(|err| PipelineError::from_io_path(err, &root))?;
         let lib = Self { root };
         if !lib.index_path().is_file() {
             lib.write_index(&LibraryIndex::default())?;
@@ -970,7 +971,10 @@ mod tests {
         lib.drop_uncompressed_ply(&entry.meta.id).unwrap();
         let again = lib.drop_uncompressed_ply(&entry.meta.id).unwrap();
         assert!(!again.has_ply);
-        assert_eq!(fs::read(Path::new(&entry.dir).join(OUTPUT_SPZ)).unwrap(), b"spz-bytes");
+        assert_eq!(
+            fs::read(Path::new(&entry.dir).join(OUTPUT_SPZ)).unwrap(),
+            b"spz-bytes"
+        );
     }
 
     #[test]
@@ -993,6 +997,9 @@ mod tests {
         let other = ArchiveLibrary::open(dir.path().join("other")).unwrap();
         let imported = other.import_3dgs(&zip_path).unwrap();
         assert!(!imported.has_ply);
-        assert_eq!(fs::read(Path::new(&imported.dir).join(OUTPUT_SPZ)).unwrap(), b"spz-bytes");
+        assert_eq!(
+            fs::read(Path::new(&imported.dir).join(OUTPUT_SPZ)).unwrap(),
+            b"spz-bytes"
+        );
     }
 }
