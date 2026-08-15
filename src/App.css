@@ -41,7 +41,7 @@ body,
 
 .shell {
   display: grid;
-  grid-template-rows: var(--titlebar-h) 1fr;
+  grid-template-rows: var(--titlebar-h) minmax(0, 1fr);
   height: 100%;
   min-height: 0;
 }
@@ -74,7 +74,7 @@ body,
 }
 
 .shell.viewer-fullscreen {
-  grid-template-rows: 1fr;
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .shell.viewer-fullscreen .titlebar,
@@ -88,7 +88,7 @@ body,
 }
 
 .shell.viewer-fullscreen .main {
-  grid-template-rows: 1fr;
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .titlebar {
@@ -205,6 +205,7 @@ button.primary {
   grid-template-columns: minmax(320px, 400px) 1fr;
   height: 100%;
   min-height: 0;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -214,6 +215,7 @@ button.primary {
   padding: 1.1rem 1.15rem 1.35rem;
   background: var(--panel);
   border-right: 1px solid var(--border);
+  min-height: 0;
   overflow: auto;
 }
 
@@ -463,13 +465,17 @@ button.primary {
 
 .main {
   display: grid;
-  grid-template-rows: 1fr 220px;
+  grid-template-rows: minmax(0, 1fr) 220px;
   min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 .viewer {
   position: relative;
   min-height: 0;
+  overflow: hidden;
   background: var(--ink);
   outline: none;
 }
@@ -607,6 +613,8 @@ progress {
 .stage-preview {
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .frame-hero {

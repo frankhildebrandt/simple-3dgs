@@ -26,7 +26,7 @@ export function CameraPreview({ preview }: Props) {
     );
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(host.clientWidth, host.clientHeight);
+    renderer.setSize(host.clientWidth, host.clientHeight, false);
     host.appendChild(renderer.domElement);
 
     const root = new THREE.Group();
@@ -128,7 +128,7 @@ export function CameraPreview({ preview }: Props) {
       }
       camera.aspect = host.clientWidth / host.clientHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(host.clientWidth, host.clientHeight);
+      renderer.setSize(host.clientWidth, host.clientHeight, false);
     };
     const observer = new ResizeObserver(onResize);
     observer.observe(host);

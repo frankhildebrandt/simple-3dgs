@@ -220,7 +220,7 @@ export function SplatViewer({
     renderer.setPixelRatio(
       viewerPixelRatio(viewerScaleForSession(scaleRef.current, liveRef.current), window.devicePixelRatio),
     );
-    renderer.setSize(host.clientWidth, host.clientHeight);
+    renderer.setSize(host.clientWidth, host.clientHeight, false);
     renderer.domElement.style.touchAction = "none";
     renderer.domElement.tabIndex = 0;
     renderer.domElement.style.outline = "none";
@@ -311,7 +311,7 @@ export function SplatViewer({
       }
       camera.aspect = host.clientWidth / host.clientHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(host.clientWidth, host.clientHeight);
+      renderer.setSize(host.clientWidth, host.clientHeight, false);
     };
     const observer = new ResizeObserver(onResize);
     observer.observe(host);
@@ -344,6 +344,22 @@ export function SplatViewer({
   useEffect(() => {
     hostRef.current?.focus();
     worldRef.current?.renderer.domElement.focus();
+    const host = hostRef.current;
+    const world = worldRef.current;
+    if (!host || !world) {
+      return;
+    }
+    const syncSize = () => {
+      if (!host.clientWidth || !host.clientHeight) {
+        return;
+      }
+      world.camera.aspect = host.clientWidth / host.clientHeight;
+      world.camera.updateProjectionMatrix();
+      world.renderer.setSize(host.clientWidth, host.clientHeight, false);
+    };
+    syncSize();
+    const frame = requestAnimationFrame(syncSize);
+    return () => cancelAnimationFrame(frame);
   }, [fullscreen]);
 
   useEffect(() => {
@@ -455,7 +471,7 @@ export function SplatViewer({
     const nextScale = viewerScaleForSession(scale, !!live);
     world.renderer.setPixelRatio(viewerPixelRatio(nextScale, window.devicePixelRatio));
     if (host.clientWidth && host.clientHeight) {
-      world.renderer.setSize(host.clientWidth, host.clientHeight);
+      world.renderer.setSize(host.clientWidth, host.clientHeight, false);
     }
   }, [ready, scale, live]);
 
