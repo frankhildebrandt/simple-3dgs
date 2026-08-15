@@ -1,0 +1,120 @@
+//! User-facing pipeline errors. Sidecar failures include a recovery hint.
+
+use std::io;
+
+use crate::settings::CaptureMode;
+
+#[derive(Debug, thiserror::Error)]
+pub enum PipelineError {
+    #[error("{0}")]
+    Message(String),
+    #[error("Cancelled")]
+    Cancelled,
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("{tool} failed (exit {code}). {hint}")]
+    Sidecar {
+        tool: String,
+        code: i32,
+        hint: String,
+    },
+}
+
+impl PipelineError {
+    pub fn message(text: impl Into<String>) -> Self {
+        Self::Message(text.into())
+    }
+
+    /// Builds a COLMAP error; `log` is the sidecar tail so flag/dyld failures are not blamed on capture.
+    pub fn colmap_failed_with(code: i32, log: &str, mode: CaptureMode) -> Self {
+        let last = last_useful_line(log);
+        let hint = if last.contains("unrecognised option") || last.contains("Failed to parse") {
+            format!("COLMAP rejected a command flag. {last}")
+        } else if last.contains("Library not loaded") || last.contains("dyld") {
+            format!("COLMAP could not load a library. {last}")
+        } else if last.is_empty() {
+            pose_hint(mode).into()
+        } else {
+            format!("{} ({last})", pose_hint(mode))
+        };
+        Self::Sidecar {
+            tool: "COLMAP".into(),
+            code,
+            hint,
+        }
+    }
+
+    pub fn ffmpeg_failed(code: i32) -> Self {
+        Self::Sidecar {
+            tool: "FFmpeg".into(),
+            code,
+            hint: "Could not read the video. Try MP4/MOV, or replace the bundled ffmpeg sidecar."
+                .into(),
+        }
+    }
+
+    pub fn brush_failed(code: i32) -> Self {
+        Self::Sidecar {
+            tool: "Brush".into(),
+            code,
+            hint: "Training stopped early. Check GPU/Metal availability and free memory (16 GB RAM minimum).".into(),
+        }
+    }
+}
+
+/// Capture-mode-specific advice when SfM cannot recover poses.
+fn pose_hint(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::Object => {
+            "Reconstruction could not estimate camera poses. Film a slower orbit with more overlap, less motion blur, and even lighting."
+        }
+        CaptureMode::Room => {
+            "Reconstruction could not estimate camera poses. Walk slowly along the walls with more overlap, even lighting, and textured surfaces. Avoid empty walls, mirrors, and exposure jumps."
+        }
+        CaptureMode::Outdoor => {
+            "Reconstruction could not estimate camera poses. Walk slowly with more overlap, keep the camera slightly tilted down to skip empty sky, and avoid wind-blown vegetation."
+        }
+    }
+}
+
+fn last_useful_line(log: &str) -> String {
+    log.lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PipelineError;
+    use crate::settings::CaptureMode;
+
+    #[test]
+    fn colmap_flag_errors_are_not_blamed_on_capture() {
+        let err = PipelineError::colmap_failed_with(
+            1,
+            "E... Failed to parse options - unrecognised option '--SiftExtraction.use_gpu'.",
+            CaptureMode::Object,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("command flag"));
+        assert!(msg.contains("SiftExtraction"));
+        assert!(!msg.contains("slower orbit"));
+    }
+
+    #[test]
+    fn room_pose_hint_is_not_an_orbit() {
+        let msg = PipelineError::colmap_failed_with(1, "", CaptureMode::Room).to_string();
+        assert!(msg.contains("walls"));
+        assert!(!msg.to_lowercase().contains("orbit"));
+    }
+
+    #[test]
+    fn outdoor_pose_hint_is_not_an_orbit() {
+        let msg = PipelineError::colmap_failed_with(1, "", CaptureMode::Outdoor).to_string();
+        assert!(msg.contains("sky"));
+        assert!(!msg.to_lowercase().contains("orbit"));
+    }
+}

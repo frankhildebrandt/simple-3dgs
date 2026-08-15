@@ -1,0 +1,61 @@
+# Dependencies
+node_modules/
+
+# Frontend build
+dist/
+dist-ssr/
+*.local
+*.tsbuildinfo
+
+# Test / coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# Caches
+.cache/
+.vite/
+.vitest/
+.eslintcache
+.npm/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+
+# Sidecar build cache (Brush clone, FFmpeg source, compiled binaries)
+/vendor/
+/src-tauri/binaries/*
+!/src-tauri/binaries/.gitignore
+!/src-tauri/binaries/README.md
+
+# Rust / Tauri
+target/
+src-tauri/gen/
+
+# Bundled app artifacts
+*.app/
+*.dmg
+*.pkg
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.sw?
+*~
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini

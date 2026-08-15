@@ -1,0 +1,39 @@
+mod app_config;
+mod archive;
+mod brush;
+mod colmap;
+mod colmap_pose;
+mod commands;
+mod error;
+mod ffmpeg;
+mod geo;
+mod html_export;
+mod pipeline;
+mod preset;
+mod project;
+mod settings;
+mod sidecar;
+mod train_log;
+
+use commands::AppState;
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
+        .manage(AppState::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::start_pipeline,
+            commands::cancel_pipeline,
+            commands::get_config,
+            commands::set_archive_dir,
+            commands::list_archive,
+            commands::import_3dgs,
+            commands::export_3dgs,
+            commands::export_html,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

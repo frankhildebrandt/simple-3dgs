@@ -1,0 +1,11 @@
+[package]
+name = "colmap-bundle"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Make a Homebrew COLMAP binary relocatable (otool / install_name_tool / codesign)"
+
+[[bin]]
+name = "colmap-bundle"
+path = "src/main.rs"
