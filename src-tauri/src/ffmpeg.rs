@@ -2,66 +2,78 @@
 
 use std::path::Path;
 
+use crate::keyframes;
 use crate::settings::{FrameFormat, PipelineSettings};
 use crate::sidecar::{path_arg, CommandSpec};
 
+pub const THUMB_EDGE: u32 = 320;
+
 /// Builds the FFmpeg `-vf` filter for extract rate and optional longest-edge scale.
+#[cfg(test)]
 pub fn video_filter(fps: f32, max_width: Option<u32>) -> String {
-    match max_width {
-        Some(width) => format!("fps={fps},scale='min(iw,{width})':-2"),
-        None => format!("fps={fps}"),
-    }
+    filter_graph(fps, None, max_width)
+}
+
+/// Dense low-res thumbs used to score sharpness and motion.
+pub fn candidate_spec(video: &Path, thumbs_dir: &Path, settings: PipelineSettings) -> CommandSpec {
+    candidate_spec_with_hwaccel(video, thumbs_dir, settings, true)
+}
+
+pub fn candidate_spec_with_hwaccel(
+    video: &Path,
+    thumbs_dir: &Path,
+    settings: PipelineSettings,
+    hwaccel: bool,
+) -> CommandSpec {
+    let settings = settings.sanitized();
+    extract_args(ExtractArgs {
+        video,
+        out_dir: thumbs_dir,
+        settings,
+        hwaccel,
+        fps: keyframes::candidate_fps(settings.fps),
+        max_width: Some(THUMB_EDGE),
+        indices: None,
+        format: FrameFormat::Jpg,
+        variable_rate: false,
+    })
+}
+
+/// Full-resolution stills at the selected candidate indices (`n` after `fps=`).
+pub fn select_spec(
+    video: &Path,
+    frames_dir: &Path,
+    settings: PipelineSettings,
+    indices: &[usize],
+) -> CommandSpec {
+    select_spec_with_hwaccel(video, frames_dir, settings, indices, true)
+}
+
+pub fn select_spec_with_hwaccel(
+    video: &Path,
+    frames_dir: &Path,
+    settings: PipelineSettings,
+    indices: &[usize],
+    hwaccel: bool,
+) -> CommandSpec {
+    let settings = settings.sanitized();
+    extract_args(ExtractArgs {
+        video,
+        out_dir: frames_dir,
+        settings,
+        hwaccel,
+        fps: keyframes::candidate_fps(settings.fps),
+        max_width: settings.longest_edge(),
+        indices: Some(indices),
+        format: settings.frame_format,
+        variable_rate: true,
+    })
 }
 
 /// Maps UI JPEG quality 1–100 (best) onto FFmpeg `-q:v` 2–31 (lower is better).
 pub fn jpeg_q_scale(quality: u8) -> u8 {
     let quality = u16::from(quality.clamp(1, 100));
     (2 + ((100 - quality) * 29) / 99) as u8
-}
-
-/// FFmpeg command that writes numbered stills into `frames_dir`.
-pub fn extract_spec(video: &Path, frames_dir: &Path, settings: PipelineSettings) -> CommandSpec {
-    extract_spec_with_hwaccel(video, frames_dir, settings, true)
-}
-
-pub fn extract_spec_with_hwaccel(
-    video: &Path,
-    frames_dir: &Path,
-    settings: PipelineSettings,
-    hwaccel: bool,
-) -> CommandSpec {
-    let settings = settings.sanitized();
-    let mut args = Vec::new();
-    args.push("-y".into());
-    if hwaccel {
-        args.push("-hwaccel".into());
-        args.push("videotoolbox".into());
-    }
-    if settings.start_seconds > 0.0 {
-        args.push("-ss".into());
-        args.push(format_seconds(settings.start_seconds));
-    }
-    args.push("-i".into());
-    args.push(path_arg(video));
-    if settings.duration_seconds > 0.0 {
-        args.push("-t".into());
-        args.push(format_seconds(settings.duration_seconds));
-    }
-    args.push("-vf".into());
-    args.push(video_filter(settings.fps, settings.longest_edge()));
-    match settings.frame_format {
-        FrameFormat::Jpg => {
-            args.push("-q:v".into());
-            args.push(jpeg_q_scale(settings.jpeg_quality).to_string());
-        }
-        FrameFormat::Png => {
-            args.push("-pix_fmt".into());
-            args.push("rgb24".into());
-        }
-    }
-    let name = format!("frame_%05d.{}", settings.frame_format.extension());
-    args.push(path_arg(&frames_dir.join(name)));
-    CommandSpec::new("ffmpeg", args)
 }
 
 /// Dumps container tags to stdout as ffmetadata. Stderr still carries QuickTime keys.
@@ -77,6 +89,72 @@ pub fn ffmetadata_spec(video: &Path) -> CommandSpec {
             "-".into(),
         ],
     )
+}
+
+struct ExtractArgs<'a> {
+    video: &'a Path,
+    out_dir: &'a Path,
+    settings: PipelineSettings,
+    hwaccel: bool,
+    fps: f32,
+    max_width: Option<u32>,
+    indices: Option<&'a [usize]>,
+    format: FrameFormat,
+    variable_rate: bool,
+}
+
+fn extract_args(req: ExtractArgs<'_>) -> CommandSpec {
+    let mut args = Vec::new();
+    args.push("-y".into());
+    if req.hwaccel {
+        args.push("-hwaccel".into());
+        args.push("videotoolbox".into());
+    }
+    if req.settings.start_seconds > 0.0 {
+        args.push("-ss".into());
+        args.push(format_seconds(req.settings.start_seconds));
+    }
+    args.push("-i".into());
+    args.push(path_arg(req.video));
+    if req.settings.duration_seconds > 0.0 {
+        args.push("-t".into());
+        args.push(format_seconds(req.settings.duration_seconds));
+    }
+    args.push("-vf".into());
+    args.push(filter_graph(req.fps, req.indices, req.max_width));
+    if req.variable_rate {
+        args.push("-fps_mode".into());
+        args.push("vfr".into());
+    }
+    match req.format {
+        FrameFormat::Jpg => {
+            args.push("-q:v".into());
+            args.push(jpeg_q_scale(req.settings.jpeg_quality).to_string());
+        }
+        FrameFormat::Png => {
+            args.push("-pix_fmt".into());
+            args.push("rgb24".into());
+        }
+    }
+    let name = format!("frame_%05d.{}", req.format.extension());
+    args.push(path_arg(&req.out_dir.join(name)));
+    CommandSpec::new("ffmpeg", args)
+}
+
+fn filter_graph(fps: f32, indices: Option<&[usize]>, max_width: Option<u32>) -> String {
+    let mut parts = vec![format!("fps={fps}")];
+    if let Some(indices) = indices {
+        let expr = indices
+            .iter()
+            .map(|index| format!("eq(n\\,{index})"))
+            .collect::<Vec<_>>()
+            .join("+");
+        parts.push(format!("select='{expr}'"));
+    }
+    if let Some(width) = max_width {
+        parts.push(format!("scale='min(iw,{width})':-2"));
+    }
+    parts.join(",")
 }
 
 fn format_seconds(value: f32) -> String {
@@ -104,19 +182,55 @@ mod tests {
     }
 
     #[test]
-    fn extract_uses_videotoolbox_and_jpg_pattern() {
-        let spec = extract_spec(
+    fn candidate_extract_uses_dense_thumbs() {
+        let spec = candidate_spec(
             Path::new("/tmp/in.mp4"),
-            Path::new("/tmp/frames"),
+            Path::new("/tmp/_candidates"),
             balanced(),
         );
         assert_eq!(spec.sidecar, "ffmpeg");
         assert!(spec.args.contains(&"-hwaccel".into()));
         assert!(spec.args.contains(&"videotoolbox".into()));
-        assert_eq!(spec.args[spec.args.len() - 1], "/tmp/frames/frame_%05d.jpg");
-        assert!(spec.args.windows(2).any(|w| w[0] == "-q:v" && w[1] == "3"));
-        assert!(!spec.args.contains(&"-ss".into()));
-        assert!(!spec.args.contains(&"-t".into()));
+        let vf = spec
+            .args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].as_str())
+            .unwrap();
+        assert!(vf.contains("fps=8"));
+        assert!(vf.contains("320"));
+        assert_eq!(
+            spec.args[spec.args.len() - 1],
+            "/tmp/_candidates/frame_%05d.jpg"
+        );
+    }
+
+    #[test]
+    fn select_keeps_candidate_indices_and_vfr() {
+        let spec = select_spec(
+            Path::new("clip.mp4"),
+            Path::new("frames"),
+            balanced(),
+            &[0, 5, 12],
+        );
+        let vf = spec
+            .args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].as_str())
+            .unwrap();
+        assert!(vf.contains("eq(n\\,0)"));
+        assert!(vf.contains("eq(n\\,5)"));
+        assert!(vf.contains("eq(n\\,12)"));
+        assert!(vf.contains("1600"));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "-fps_mode" && w[1] == "vfr"));
+        assert_eq!(
+            spec.args.last().map(String::as_str),
+            Some("frames/frame_%05d.jpg")
+        );
     }
 
     #[test]
@@ -126,10 +240,10 @@ mod tests {
     }
 
     #[test]
-    fn png_export_skips_jpeg_qscale_and_uses_rgb() {
+    fn png_select_skips_jpeg_qscale_and_uses_rgb() {
         let mut settings = balanced();
         settings.frame_format = FrameFormat::Png;
-        let spec = extract_spec(Path::new("clip.mp4"), Path::new("frames"), settings);
+        let spec = select_spec(Path::new("clip.mp4"), Path::new("frames"), settings, &[1]);
         assert_eq!(
             spec.args.last().map(String::as_str),
             Some("frames/frame_%05d.png")
@@ -143,9 +257,9 @@ mod tests {
 
     #[test]
     fn software_decode_omits_hwaccel() {
-        let spec = extract_spec_with_hwaccel(
+        let spec = candidate_spec_with_hwaccel(
             Path::new("clip.mov"),
-            Path::new("frames"),
+            Path::new("thumbs"),
             PipelineSettings::from_preset(Preset::Fast),
             false,
         );
@@ -157,7 +271,7 @@ mod tests {
         let mut settings = balanced();
         settings.start_seconds = 12.5;
         settings.duration_seconds = 40.0;
-        let spec = extract_spec(Path::new("clip.mp4"), Path::new("frames"), settings);
+        let spec = candidate_spec(Path::new("clip.mp4"), Path::new("thumbs"), settings);
         let ss = spec.args.iter().position(|a| a == "-ss").unwrap();
         let input = spec.args.iter().position(|a| a == "-i").unwrap();
         let duration = spec.args.iter().position(|a| a == "-t").unwrap();

@@ -38,7 +38,13 @@ Pinned via `BRUSH_REF` in `scripts/fetch-sidecars.sh` (default: `main`, which sh
 
 - Project: https://github.com/sparkjsdev/spark
 - License: MIT
-- Role: in-app Gaussian splat viewer (WebGL2 / Three.js)
+- Role: in-app Gaussian splat viewer (WebGL2 / Three.js) and PLY→SPZ v3 transcode for HTML / `.spz` export
+
+## Niantic SPZ
+
+- Project: https://github.com/nianticlabs/spz
+- License: MIT
+- Role: compressed Gaussian splat file format used for HTML and share export. The app writes Spark-compatible **SPZ v3** (gzip). Training archives stay lossless PLY.
 
 ## Three.js
 

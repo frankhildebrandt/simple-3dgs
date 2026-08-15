@@ -14,6 +14,16 @@ pub enum CaptureMode {
     Outdoor,
 }
 
+impl CaptureMode {
+    /// Hard video keyframe cap. Outdoor paths can run much longer than orbits or rooms.
+    pub fn max_frames_cap(self) -> u32 {
+        match self {
+            Self::Object | Self::Room => 800,
+            Self::Outdoor => 10_000,
+        }
+    }
+}
+
 /// Still format written by FFmpeg. PNG is lossless; JPEG uses [`PipelineSettings::jpeg_quality`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -51,6 +61,9 @@ pub struct PipelineSettings {
     /// Brush `--max-splats`. Missing in old archive JSON; Balanced default applies.
     #[serde(default = "default_max_splats")]
     pub max_splats: u32,
+    /// Hard cap on motion-adaptive video keyframes. Missing in old archive JSON.
+    #[serde(default = "default_max_frames")]
+    pub max_frames: u32,
 }
 
 fn default_jpeg_quality() -> u8 {
@@ -59,6 +72,10 @@ fn default_jpeg_quality() -> u8 {
 
 fn default_max_splats() -> u32 {
     5_000_000
+}
+
+fn default_max_frames() -> u32 {
+    250
 }
 
 impl PipelineSettings {
@@ -75,6 +92,7 @@ impl PipelineSettings {
                 match_overlap: 15,
                 capture_mode: CaptureMode::Object,
                 max_splats: 2_000_000,
+                max_frames: 120,
             },
             Preset::Balanced => Self {
                 fps: 2.0,
@@ -87,6 +105,7 @@ impl PipelineSettings {
                 match_overlap: 15,
                 capture_mode: CaptureMode::Object,
                 max_splats: 5_000_000,
+                max_frames: 250,
             },
             Preset::Quality => Self {
                 fps: 4.0,
@@ -99,6 +118,7 @@ impl PipelineSettings {
                 match_overlap: 15,
                 capture_mode: CaptureMode::Object,
                 max_splats: 10_000_000,
+                max_frames: 500,
             },
         }
     }
@@ -119,6 +139,7 @@ impl PipelineSettings {
             match_overlap: self.match_overlap.clamp(2, 50),
             capture_mode: self.capture_mode,
             max_splats: self.max_splats.clamp(100_000, 20_000_000),
+            max_frames: self.max_frames.clamp(8, self.capture_mode.max_frames_cap()),
         }
     }
 
@@ -234,6 +255,51 @@ mod tests {
         let settings: PipelineSettings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.capture_mode, CaptureMode::Object);
         assert_eq!(settings.max_splats, 5_000_000);
+        assert_eq!(settings.max_frames, 250);
+    }
+
+    #[test]
+    fn presets_raise_frame_budget_with_quality() {
+        assert_eq!(PipelineSettings::from_preset(Preset::Fast).max_frames, 120);
+        assert_eq!(
+            PipelineSettings::from_preset(Preset::Balanced).max_frames,
+            250
+        );
+        assert_eq!(
+            PipelineSettings::from_preset(Preset::Quality).max_frames,
+            500
+        );
+    }
+
+    #[test]
+    fn max_frames_cap_is_higher_outdoors() {
+        assert_eq!(CaptureMode::Object.max_frames_cap(), 800);
+        assert_eq!(CaptureMode::Room.max_frames_cap(), 800);
+        assert_eq!(CaptureMode::Outdoor.max_frames_cap(), 10_000);
+    }
+
+    #[test]
+    fn sanitized_clamps_max_frames() {
+        let low = PipelineSettings {
+            max_frames: 1,
+            ..PipelineSettings::from_preset(Preset::Fast)
+        };
+        assert_eq!(low.sanitized().max_frames, 8);
+        let high = PipelineSettings {
+            max_frames: 9_000,
+            ..PipelineSettings::from_preset(Preset::Fast)
+        };
+        assert_eq!(high.sanitized().max_frames, 800);
+        let mut room = PipelineSettings::from_preset(Preset::Fast);
+        room.capture_mode = CaptureMode::Room;
+        room.max_frames = 9_000;
+        assert_eq!(room.sanitized().max_frames, 800);
+        let mut outdoor = PipelineSettings::from_preset(Preset::Fast);
+        outdoor.capture_mode = CaptureMode::Outdoor;
+        outdoor.max_frames = 10_000;
+        assert_eq!(outdoor.sanitized().max_frames, 10_000);
+        outdoor.max_frames = 20_000;
+        assert_eq!(outdoor.sanitized().max_frames, 10_000);
     }
 
     #[test]

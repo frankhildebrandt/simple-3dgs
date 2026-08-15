@@ -15,6 +15,8 @@ use crate::project::Stage;
 use crate::settings::PipelineSettings;
 use crate::sidecar::{CancelFlag, ProcessRunner};
 use crate::train_log::TrainSnapshot;
+use base64::Engine;
+use tauri::ipc::{InvokeBody, Request};
 
 pub struct AppState {
     pub cancel: CancelFlag,
@@ -181,15 +183,19 @@ pub fn get_config(app: AppHandle) -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-pub fn set_archive_dir(app: AppHandle, path: String) -> Result<AppConfig, String> {
-    if path.trim().is_empty() {
+pub fn save_config(app: AppHandle, mut config: AppConfig) -> Result<AppConfig, String> {
+    if config.archive_dir.trim().is_empty() {
         return Err("Choose an archive folder.".into());
     }
-    let archive = PathBuf::from(&path);
+    let archive = PathBuf::from(&config.archive_dir);
     std::fs::create_dir_all(&archive).map_err(|err| err.to_string())?;
-    let config = AppConfig {
-        archive_dir: archive.to_string_lossy().into_owned(),
-    };
+    if !config.temp_project {
+        let project = config.project_dir.as_deref().unwrap_or("").trim();
+        if project.is_empty() {
+            return Err("Choose a project folder.".into());
+        }
+        config.project_dir = Some(project.to_string());
+    }
     app_config::save(&config_dir(&app)?, &config).map_err(|err| err.to_string())?;
     ArchiveLibrary::open(&archive).map_err(|err| err.to_string())?;
     Ok(config)
@@ -198,6 +204,43 @@ pub fn set_archive_dir(app: AppHandle, path: String) -> Result<AppConfig, String
 #[tauri::command]
 pub fn list_archive(app: AppHandle) -> Result<Vec<ArchiveEntry>, String> {
     library(&app)?.list().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn get_archive(app: AppHandle, id: String) -> Result<ArchiveEntry, String> {
+    library(&app)?.get(&id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn rename_archive(app: AppHandle, id: String, title: String) -> Result<ArchiveEntry, String> {
+    let entry = library(&app)?
+        .rename(&id, &title)
+        .map_err(|err| err.to_string())?;
+    emit_archive_changed(&app, &entry.meta.id);
+    Ok(entry)
+}
+
+#[tauri::command]
+pub fn delete_archive(app: AppHandle, id: String) -> Result<(), String> {
+    library(&app)?.remove(&id).map_err(|err| err.to_string())?;
+    emit_archive_changed(&app, &id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_archive_poster(
+    app: AppHandle,
+    id: String,
+    jpeg_base64: String,
+) -> Result<ArchiveEntry, String> {
+    let jpeg = base64::engine::general_purpose::STANDARD
+        .decode(jpeg_base64.trim())
+        .map_err(|err| format!("Invalid preview image: {err}"))?;
+    let entry = library(&app)?
+        .set_poster(&id, &jpeg)
+        .map_err(|err| err.to_string())?;
+    emit_archive_changed(&app, &entry.meta.id);
+    Ok(entry)
 }
 
 #[tauri::command]
@@ -221,6 +264,50 @@ pub fn export_html(app: AppHandle, id: String, dest_dir: String) -> Result<(), S
     html_export::export_html(&entry, Path::new(&dest_dir)).map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+pub fn spz_cache_fresh(app: AppHandle, id: String) -> Result<bool, String> {
+    library(&app)?
+        .spz_is_fresh(&id)
+        .map_err(|err| err.to_string())
+}
+
+/// Receives SPZ bytes as a raw IPC body; archive id is in the `id` header.
+#[tauri::command]
+pub fn cache_archive_spz(app: AppHandle, request: Request<'_>) -> Result<(), String> {
+    let id = request
+        .headers()
+        .get("id")
+        .ok_or_else(|| "Missing archive id.".to_string())?
+        .to_str()
+        .map_err(|err| err.to_string())?
+        .to_string();
+    let bytes = match request.body() {
+        InvokeBody::Raw(bytes) => bytes.as_slice(),
+        InvokeBody::Json(_) => {
+            return Err("SPZ cache expects a binary payload.".into());
+        }
+    };
+    library(&app)?
+        .write_spz(&id, bytes)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn export_spz(app: AppHandle, id: String, dest_path: String) -> Result<(), String> {
+    library(&app)?
+        .export_spz(&id, Path::new(&dest_path))
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn drop_archive_ply(app: AppHandle, id: String) -> Result<ArchiveEntry, String> {
+    let entry = library(&app)?
+        .drop_uncompressed_ply(&id)
+        .map_err(|err| err.to_string())?;
+    emit_archive_changed(&app, &entry.meta.id);
+    Ok(entry)
+}
+
 fn load_config(app: &AppHandle) -> Result<AppConfig, String> {
     let documents = app.path().document_dir().map_err(|err| err.to_string())?;
     let default_archive = app_config::default_archive_dir(&documents);
@@ -234,4 +321,8 @@ fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
 fn library(app: &AppHandle) -> Result<ArchiveLibrary, String> {
     let config = load_config(app)?;
     ArchiveLibrary::open(&config.archive_dir).map_err(|err| err.to_string())
+}
+
+fn emit_archive_changed(app: &AppHandle, id: &str) {
+    let _ = app.emit("archive-changed", id);
 }

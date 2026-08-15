@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Simple 3DGS">
+  <rect width="128" height="128" rx="28" fill="#14161a"/>
+  <defs>
+    <radialGradient id="amber" cx="50%" cy="42%" r="55%">
+      <stop offset="0%" stop-color="#fff6e0"/>
+      <stop offset="32%" stop-color="#f0b24a" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#d98a32" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cyan" cx="50%" cy="42%" r="55%">
+      <stop offset="0%" stop-color="#e8ffff"/>
+      <stop offset="38%" stop-color="#3aa8b8" stop-opacity="0.92"/>
+      <stop offset="100%" stop-color="#3aa8b8" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="1.4"/>
+    </filter>
+  </defs>
+  <g filter="url(#soft)" style="mix-blend-mode:screen">
+    <ellipse cx="58" cy="60" rx="28" ry="38" transform="rotate(-28 58 60)" fill="url(#amber)"/>
+    <ellipse cx="74" cy="66" rx="36" ry="24" transform="rotate(22 74 66)" fill="url(#amber)"/>
+    <ellipse cx="48" cy="78" rx="20" ry="16" transform="rotate(-12 48 78)" fill="url(#cyan)"/>
+  </g>
+</svg>

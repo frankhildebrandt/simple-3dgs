@@ -1,41 +1,55 @@
+import { useEffect } from "react";
+import { captureTips } from "../captureTips";
 import type { CaptureMode } from "../types";
 
 type Props = {
   mode: CaptureMode;
+  open: boolean;
+  onClose: () => void;
 };
 
-const SHARED = [
-  "Keep exposure and focal length fixed. Do not zoom while filming.",
-  "Avoid motion blur: stabilize, add light, or slow down.",
-  "Quality preset can take hours on Apple Silicon. Start with Fast.",
-  "16 GB unified memory is the practical minimum.",
-];
+/** Overlay with mode-specific filming advice. */
+export function CaptureHints({ mode, open, onClose }: Props) {
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
-const TIPS: Record<CaptureMode, string[]> = {
-  object: ["Walk a slow orbit around the subject. Overlap consecutive views.", ...SHARED],
-  room: [
-    "Walk slowly along the walls. Look slightly at surfaces, not empty floor.",
-    "Overlap consecutive views. Empty walls, mirrors, and exposure jumps break matching.",
-    "See-through walls come from unobserved angles and floaters, not the viewer. Close the loop and avoid blank surfaces.",
-    ...SHARED,
-  ],
-  outdoor: [
-    "Walk slowly along a path. Overlap consecutive views.",
-    "Tilt the camera slightly down — empty sky has no features.",
-    "Avoid wind-blown vegetation and hard sun/shade exposure jumps.",
-    ...SHARED,
-  ],
-};
+  if (!open) {
+    return null;
+  }
 
-export function CaptureHints({ mode }: Props) {
+  const title = `Capture tips · ${mode}`;
+
   return (
-    <aside className="hints">
-      <h2>Capture tips</h2>
-      <ul>
-        {TIPS[mode].map((tip) => (
-          <li key={tip}>{tip}</li>
-        ))}
-      </ul>
-    </aside>
+    <div className="dialog-backdrop" onClick={onClose}>
+      <div
+        className="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="capture-hints-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="dialog-head">
+          <h2 id="capture-hints-title">{title}</h2>
+          <button type="button" className="icon-btn" aria-label="Close" autoFocus onClick={onClose}>
+            ×
+          </button>
+        </header>
+        <ul className="hints-list">
+          {captureTips(mode).map((tip) => (
+            <li key={tip}>{tip}</li>
+          ))}
+        </ul>
+      </div>
+    </div>
   );
 }

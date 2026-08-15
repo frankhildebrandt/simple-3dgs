@@ -18,18 +18,6 @@ pub struct ViewPose {
     pub quaternion: [f64; 4],
 }
 
-impl ViewPose {
-    /// Point `distance` units in front of the camera (Three.js -Z).
-    pub fn look_target(&self, distance: f64) -> [f64; 3] {
-        let forward = rotate_vec(self.quaternion, [0.0, 0.0, -distance]);
-        [
-            self.position[0] + forward[0],
-            self.position[1] + forward[1],
-            self.position[2] + forward[2],
-        ]
-    }
-}
-
 /// Writes `output/view.json` from `colmap/sparse/0/images.bin`. Missing or fake bins are skipped.
 pub fn write_output_view(layout: &ProjectLayout) {
     let Some(pose) = first_view_pose(&layout.sparse_model_dir().join("images.bin")) else {
@@ -215,19 +203,6 @@ fn mulv(m: Mat3, v: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-fn rotate_vec(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
-    let [x, y, z, w] = q;
-    let [vx, vy, vz] = v;
-    let tx = 2.0 * (y * vz - z * vy);
-    let ty = 2.0 * (z * vx - x * vz);
-    let tz = 2.0 * (x * vy - y * vx);
-    [
-        vx + w * tx + (y * tz - z * ty),
-        vy + w * ty + (z * tx - x * tz),
-        vz + w * tz + (x * ty - y * tx),
-    ]
-}
-
 fn read_u64(cur: &mut Cursor<&[u8]>) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     cur.read_exact(&mut buf)?;
@@ -377,17 +352,5 @@ mod tests {
         assert!((pose.position[0] + 1.0).abs() < 1e-9);
         assert!((pose.position[1] - 2.0).abs() < 1e-9);
         assert!((pose.position[2] - 3.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn look_target_is_in_front_of_identity_camera() {
-        let pose = ViewPose {
-            position: [0.0, 0.0, 0.0],
-            quaternion: [0.0, 0.0, 0.0, 1.0],
-        };
-        let target = pose.look_target(2.0);
-        assert!((target[0]).abs() < 1e-9);
-        assert!((target[1]).abs() < 1e-9);
-        assert!((target[2] + 2.0).abs() < 1e-9);
     }
 }

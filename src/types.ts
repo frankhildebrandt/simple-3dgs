@@ -36,6 +36,7 @@ export type PipelineSettings = {
   matchOverlap: number;
   captureMode: CaptureMode;
   maxSplats: number;
+  maxFrames: number;
 };
 
 export type PipelineRequest = {
@@ -50,7 +51,7 @@ export type PipelineRequest = {
 
 export type RunStatus = "idle" | "running" | "done" | "error";
 
-export type AppView = "reconstruct" | "archive";
+export type AppView = "easy" | "expert" | "archive";
 
 export type GeoFix = {
   lat: number;
@@ -73,10 +74,14 @@ export type ArchiveEntry = {
   plyPath: string;
   posterPath?: string | null;
   dir: string;
+  hasPly: boolean;
 };
 
 export type AppConfig = {
   archiveDir: string;
+  uiMode: AppView;
+  tempProject: boolean;
+  projectDir?: string | null;
 };
 
 export type RunResult = {
@@ -97,6 +102,7 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     matchOverlap: 15,
     captureMode: "object",
     maxSplats: 2_000_000,
+    maxFrames: 120,
   },
   balanced: {
     fps: 2,
@@ -109,6 +115,7 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     matchOverlap: 15,
     captureMode: "object",
     maxSplats: 5_000_000,
+    maxFrames: 250,
   },
   quality: {
     fps: 4,
@@ -121,8 +128,14 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     matchOverlap: 15,
     captureMode: "object",
     maxSplats: 10_000_000,
+    maxFrames: 500,
   },
 };
+
+/** Hard video keyframe cap. Outdoor paths can run much longer than orbits or rooms. */
+export function maxFramesCap(mode: CaptureMode): number {
+  return mode === "outdoor" ? 10_000 : 800;
+}
 
 /** Returns the named preset when core knobs still match, ignoring clip trim. */
 export function matchingPreset(settings: PipelineSettings): Preset | null {
@@ -133,7 +146,8 @@ export function matchingPreset(settings: PipelineSettings): Preset | null {
       preset.maxImageSize === settings.maxImageSize &&
       preset.trainSteps === settings.trainSteps &&
       preset.matchOverlap === settings.matchOverlap &&
-      preset.maxSplats === settings.maxSplats
+      preset.maxSplats === settings.maxSplats &&
+      preset.maxFrames === settings.maxFrames
     ) {
       return id;
     }

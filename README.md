@@ -1,13 +1,31 @@
+<p align="center">
+  <img src="src-tauri/icons/icon.png" width="128" height="128" alt="Simple 3DGS">
+</p>
+
 # Simple 3DGS
 
-Desktop app that turns a video (or a folder of stills) into a 3D Gaussian
-splat. macOS Apple Silicon only.
+**Video in, Gaussian splat out.**
+
+A small macOS app. You walk around something with your phone, drop the clip, and get a 3D Gaussian splat you can fly through. No Python. No CUDA. No Homebrew on the machine that runs it.
 
 ```
 Video → FFmpeg frames → COLMAP poses → Brush training → Spark viewer
 ```
 
-No Homebrew on the end-user machine. Sidecars are copied into the `.app`.
+FFmpeg, COLMAP, and Brush live inside the `.app`. The UI is dark charcoal and amber — same as the mark: a handful of glowing ellipsoids, which is all a splat really is.
+
+Intentionally not in scope: 4D, 360, upscaling, mesh export, a cloud. One camera, one focal length, one Mac.
+
+## Capture
+
+Bad splats are almost always bad capture, not the trainer. Shoot for COLMAP first.
+
+1. Pick **Object** (slow orbit), **Room** (along the walls), or **Outdoor** (along a path).
+2. Drop a video or a folder of stills. No zoom, fixed exposure, little motion blur.
+3. Start with **Fast**. **Quality** can take hours; use it when Fast already found a plausible scene.
+4. **Reconstruct.** Then fly it. Finished scenes land in an archive, on a map if the clip has GPS.
+
+If cameras do not recover, reshoot: slower, more overlap, less blur. Rooms need textured walls. Outdoors, tilt down off empty sky.
 
 ## Requirements
 
@@ -37,17 +55,6 @@ npm run tauri build
 copies a relocatable COLMAP 4.1 from Homebrew (dylibs + Qt frameworks),
 and builds Brush `brush-cli` from `main`. The resulting sidecars stay
 gitignored under `src-tauri/binaries/`.
-
-## Use
-
-1. Choose a capture type: Object (orbit), Room, or Outdoor.
-2. Drop a video (slow motion, overlap, no zoom) or pick an image folder.
-3. Choose a project folder and a preset: Fast / Balanced / Quality.
-4. Click **Reconstruct**. Quality can take hours.
-5. Fly the splat in the viewer. Output is `project/output/scene.ply`.
-
-If COLMAP cannot recover cameras, reshoot: slower motion, more overlap,
-less blur. Rooms need textured walls; outdoors, tilt down off empty sky.
 
 ## License
 

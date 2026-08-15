@@ -8,6 +8,7 @@ use crate::error::PipelineError;
 
 pub const MIN_FRAMES: usize = 8;
 pub const OUTPUT_PLY: &str = "scene.ply";
+pub const OUTPUT_SPZ: &str = "scene.spz";
 pub const VIEW_JSON: &str = "view.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,11 @@ impl ProjectLayout {
 
     pub fn frames_dir(&self) -> PathBuf {
         self.root.join("frames")
+    }
+
+    /// Dense scoring thumbs; deleted after keyframe extract.
+    pub fn candidates_dir(&self) -> PathBuf {
+        self.root.join("_candidates")
     }
 
     pub fn colmap_dir(&self) -> PathBuf {
@@ -161,6 +167,10 @@ impl ProjectLayout {
         match stage {
             Stage::Frames => {
                 remove_dir_contents(&self.frames_dir())?;
+                let candidates = self.candidates_dir();
+                if candidates.exists() {
+                    fs::remove_dir_all(&candidates)?;
+                }
                 remove_dir_contents(&self.dataset_dir())?;
                 self.remove_databases()?;
                 remove_dir_contents(&self.sparse_dir())?;
@@ -370,6 +380,17 @@ mod tests {
         assert!(layout.is_complete(Stage::Frames));
         layout.clear_from(Stage::Frames).unwrap();
         assert!(!layout.is_complete(Stage::Frames));
+    }
+
+    #[test]
+    fn clear_from_frames_removes_candidate_thumbs() {
+        let dir = tempdir().unwrap();
+        let layout = ProjectLayout::new(dir.path());
+        layout.create().unwrap();
+        fs::create_dir_all(layout.candidates_dir()).unwrap();
+        fs::write(layout.candidates_dir().join("frame_00001.jpg"), b"x").unwrap();
+        layout.clear_from(Stage::Frames).unwrap();
+        assert!(!layout.candidates_dir().exists());
     }
 
     #[test]

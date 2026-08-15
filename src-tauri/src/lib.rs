@@ -8,6 +8,7 @@ mod error;
 mod ffmpeg;
 mod geo;
 mod html_export;
+mod keyframes;
 mod pipeline;
 mod preset;
 mod project;
@@ -28,11 +29,19 @@ pub fn run() {
             commands::start_pipeline,
             commands::cancel_pipeline,
             commands::get_config,
-            commands::set_archive_dir,
+            commands::save_config,
             commands::list_archive,
+            commands::get_archive,
+            commands::rename_archive,
+            commands::delete_archive,
+            commands::set_archive_poster,
             commands::import_3dgs,
             commands::export_3dgs,
             commands::export_html,
+            commands::spz_cache_fresh,
+            commands::cache_archive_spz,
+            commands::export_spz,
+            commands::drop_archive_ply,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

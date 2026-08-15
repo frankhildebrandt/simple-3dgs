@@ -2,11 +2,25 @@ import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as THREE from "three";
-import { SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+import { SparkControls, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import { LookCapture, isLookCaptureClick, isLookReleaseKey } from "../lookCapture";
 import { applyPointerLook } from "../pointerLook";
+import { jpegBase64FromCanvas, scaledJpegDataUrl } from "../previewCapture";
+import { loadPlyBytes } from "../spzTranscode";
+import { splatFileName, splatKindFromPath } from "../splatFile";
 import type { CaptureMode } from "../types";
-import { viewerProfile } from "../viewerProfile";
+import {
+  applyViewerMode,
+  nextViewerMode,
+  viewerModeLabel,
+  type ViewerMode,
+} from "../viewerMode";
+import { sparkTuning, viewerProfile } from "../viewerProfile";
+import {
+  viewerPixelRatio,
+  viewerScaleForSession,
+  type ViewerScale,
+} from "../viewerPixelRatio";
 
 type Props = {
   plyPath: string | null;
@@ -14,6 +28,7 @@ type Props = {
   live?: boolean;
   fullscreen?: boolean;
   onToggleFullscreen?: () => void;
+  onSetPreview?: (jpegBase64: string) => void | Promise<void>;
 };
 
 type ViewPose = {
@@ -91,8 +106,14 @@ function frameSplat(
   camera.near = Math.max(0.01, extent * 0.0001);
   camera.far = Math.max(1000, extent * (mode === "outdoor" ? 80 : 40));
   camera.updateProjectionMatrix();
-  controls.fpsMovement.moveSpeed =
+    controls.fpsMovement.moveSpeed =
     mode === "outdoor" ? Math.max(extent * 0.15, 2) : Math.max(extent * 0.08, 0.5);
+}
+
+/** Removes a Spark mesh from the scene and frees its GPU buffers. */
+function dropSplat(mesh: SplatMesh) {
+  mesh.removeFromParent();
+  mesh.dispose();
 }
 
 async function loadViewPose(plyPath: string): Promise<ViewPose | null> {
@@ -122,12 +143,61 @@ export function SplatViewer({
   live,
   fullscreen,
   onToggleFullscreen,
+  onSetPreview,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<World | null>(null);
   const modeRef = useRef(captureMode);
   modeRef.current = captureMode;
   const [ready, setReady] = useState(false);
+  const [framed, setFramed] = useState(false);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [scale, setScale] = useState<ViewerScale>("fast");
+  const [viewMode, setViewMode] = useState<ViewerMode>("splats");
+  const liveRef = useRef(!!live);
+  liveRef.current = !!live;
+  const scaleRef = useRef(scale);
+  scaleRef.current = scale;
+  const viewModeRef = useRef(viewMode);
+  viewModeRef.current = viewMode;
+  const pendingPathRef = useRef<string | null>(null);
+  const shownPathRef = useRef<string | null>(null);
+  const loadingRef = useRef(false);
+
+  /** Renders the current view to JPEG base64, or null if the splat is not framed. */
+  function capturePreview(): string | null {
+    const world = worldRef.current;
+    if (!world?.splat || !world.framed) {
+      return null;
+    }
+    const profile = viewerProfile(modeRef.current, liveRef.current);
+    applyViewerMode(world.spark, "splats", profile);
+    try {
+      world.renderer.render(world.scene, world.camera);
+      const canvas = world.renderer.domElement;
+      return jpegBase64FromCanvas(canvas, (_source, width, height) =>
+        scaledJpegDataUrl(canvas, width, height),
+      );
+    } finally {
+      applyViewerMode(world.spark, viewModeRef.current, profile);
+    }
+  }
+
+  async function setPreviewFromView() {
+    if (!onSetPreview || previewBusy) {
+      return;
+    }
+    const jpeg = capturePreview();
+    if (!jpeg) {
+      return;
+    }
+    setPreviewBusy(true);
+    try {
+      await onSetPreview(jpeg);
+    } finally {
+      setPreviewBusy(false);
+    }
+  }
 
   useEffect(() => {
     const host = hostRef.current;
@@ -145,8 +215,14 @@ export function SplatViewer({
     );
     camera.position.set(0, 0.4, 2.4);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const renderer = new THREE.WebGLRenderer({
+      antialias: false,
+      alpha: false,
+      powerPreference: "high-performance",
+    });
+    renderer.setPixelRatio(
+      viewerPixelRatio(viewerScaleForSession(scaleRef.current, liveRef.current), window.devicePixelRatio),
+    );
     renderer.setSize(host.clientWidth, host.clientHeight);
     renderer.domElement.style.touchAction = "none";
     renderer.domElement.tabIndex = 0;
@@ -154,13 +230,13 @@ export function SplatViewer({
     host.tabIndex = 0;
     host.appendChild(renderer.domElement);
 
-    const profile = viewerProfile(modeRef.current);
+    const profile = viewerProfile(modeRef.current, liveRef.current);
     const spark = new SparkRenderer({
       renderer,
-      minAlpha: profile.minAlpha,
-      lodRenderScale: profile.lodRenderScale,
-      behindFoveate: profile.behindFoveate,
+      ...sparkTuning(profile),
+      enableLod: !liveRef.current,
     });
+    applyViewerMode(spark, viewModeRef.current, profile);
     scene.add(spark);
 
     const controls = new SparkControls({ canvas: renderer.domElement });
@@ -253,8 +329,12 @@ export function SplatViewer({
       void look.exit();
       controls.fpsMovement.enable = false;
       controls.pointerControls.enable = false;
-      worldRef.current?.splat?.removeFromParent();
+      const splat = worldRef.current?.splat;
+      if (splat) {
+        dropSplat(splat);
+      }
       spark.removeFromParent();
+      spark.dispose();
       renderer.dispose();
       worldRef.current = null;
       setReady(false);
@@ -270,37 +350,84 @@ export function SplatViewer({
   }, [fullscreen]);
 
   useEffect(() => {
-    const world = worldRef.current;
-    if (!ready || !world || !plyPath) {
+    if (!ready) {
       return;
     }
-    const url = `${convertFileSrc(plyPath)}?t=${Date.now()}`;
-    const profile = viewerProfile(modeRef.current);
-    const next = new SplatMesh({
-      url,
-      lod: profile.lod,
-      lodAbove: profile.lodAbove,
-    });
-    next.quaternion.set(1, 0, 0, 0);
-    world.scene.add(next);
-    const previous = world.splat;
-    world.splat = next;
-    if (previous) {
-      previous.removeFromParent();
+    if (!worldRef.current?.splat) {
+      shownPathRef.current = null;
     }
-    const posePromise = loadViewPose(plyPath);
-    void next.initialized.then(async (mesh) => {
-      if (worldRef.current?.splat !== mesh || world.framed) {
+    pendingPathRef.current = plyPath;
+    if (!plyPath) {
+      return;
+    }
+    void loadLatest();
+
+    /** Loads the newest pending PLY; skips start if a decode is already running. */
+    async function loadLatest() {
+      const world = worldRef.current;
+      if (!world || loadingRef.current) {
         return;
       }
-      const view = await posePromise;
-      if (worldRef.current?.splat !== mesh || world.framed) {
+      const path = pendingPathRef.current;
+      if (!path || path === shownPathRef.current) {
         return;
       }
-      world.view = view;
-      frameSplat(world.camera, world.controls, mesh, modeRef.current, view);
-      world.framed = true;
-    });
+      loadingRef.current = true;
+      const posePromise = loadViewPose(path);
+      let next: SplatMesh | null = null;
+      try {
+        const bytes = await loadPlyBytes(path);
+        if (worldRef.current !== world || pendingPathRef.current !== path) {
+          return;
+        }
+        const profile = viewerProfile(modeRef.current, liveRef.current);
+        const kind = splatKindFromPath(path);
+        next = new SplatMesh({
+          fileBytes: bytes,
+          fileType: kind === "spz" ? SplatFileType.SPZ : SplatFileType.PLY,
+          fileName: splatFileName(path),
+          lod: profile.lod,
+          lodAbove: profile.lodAbove,
+          raycastable: false,
+        });
+        next.quaternion.set(1, 0, 0, 0);
+        world.scene.add(next);
+        const mesh = await next.initialized;
+        next = mesh;
+        if (worldRef.current !== world || pendingPathRef.current === null) {
+          dropSplat(mesh);
+          return;
+        }
+        const previous = world.splat;
+        world.splat = mesh;
+        shownPathRef.current = path;
+        world.framed = false;
+        setFramed(false);
+        const view = await posePromise;
+        if (worldRef.current?.splat !== mesh) {
+          return;
+        }
+        world.view = view;
+        frameSplat(world.camera, world.controls, mesh, modeRef.current, view);
+        world.framed = true;
+        setFramed(true);
+        if (previous && previous !== mesh) {
+          dropSplat(previous);
+        }
+      } catch {
+        if (next && worldRef.current?.splat !== next) {
+          dropSplat(next);
+        }
+        if (pendingPathRef.current === path) {
+          pendingPathRef.current = shownPathRef.current;
+        }
+      } finally {
+        loadingRef.current = false;
+        if (worldRef.current === world && pendingPathRef.current !== shownPathRef.current) {
+          void loadLatest();
+        }
+      }
+    }
   }, [plyPath, ready]);
 
   useEffect(() => {
@@ -309,17 +436,38 @@ export function SplatViewer({
     if (!ready || !world || !mesh || !world.framed) {
       return;
     }
-    const profile = viewerProfile(captureMode);
-    world.spark.minAlpha = profile.minAlpha;
-    world.spark.lodRenderScale = profile.lodRenderScale;
-    world.spark.behindFoveate = profile.behindFoveate;
+    const profile = viewerProfile(captureMode, live);
+    Object.assign(world.spark, sparkTuning(profile));
+    world.spark.enableLod = !live;
+    applyViewerMode(world.spark, viewModeRef.current, profile);
     void mesh.initialized.then((readyMesh) => {
       if (worldRef.current?.splat !== readyMesh) {
         return;
       }
       frameSplat(world.camera, world.controls, readyMesh, captureMode, world.view);
     });
-  }, [captureMode, ready]);
+  }, [captureMode, ready, live]);
+
+  useEffect(() => {
+    const world = worldRef.current;
+    const host = hostRef.current;
+    if (!ready || !world || !host) {
+      return;
+    }
+    const nextScale = viewerScaleForSession(scale, !!live);
+    world.renderer.setPixelRatio(viewerPixelRatio(nextScale, window.devicePixelRatio));
+    if (host.clientWidth && host.clientHeight) {
+      world.renderer.setSize(host.clientWidth, host.clientHeight);
+    }
+  }, [ready, scale, live]);
+
+  useEffect(() => {
+    const world = worldRef.current;
+    if (!ready || !world) {
+      return;
+    }
+    applyViewerMode(world.spark, viewMode, viewerProfile(modeRef.current, liveRef.current));
+  }, [ready, viewMode]);
 
   const hint = live
     ? "Live preview — Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster"
@@ -327,11 +475,38 @@ export function SplatViewer({
 
   return (
     <div className="viewer" ref={hostRef}>
-      {onToggleFullscreen ? (
-        <button type="button" className="viewer-expand" onClick={onToggleFullscreen}>
-          {fullscreen ? "Exit fullscreen" : "Fullscreen"}
+      {onSetPreview ? (
+        <button
+          type="button"
+          className="viewer-preview"
+          disabled={!framed || previewBusy}
+          onClick={() => void setPreviewFromView()}
+        >
+          {previewBusy ? "Saving preview…" : "Set as preview"}
         </button>
       ) : null}
+      <div className="viewer-actions">
+        <button
+          type="button"
+          className="viewer-mode"
+          onClick={() => setViewMode((current) => nextViewerMode(current))}
+        >
+          {viewerModeLabel(viewMode)}
+        </button>
+        <button
+          type="button"
+          className="viewer-scale"
+          disabled={!!live}
+          onClick={() => setScale((current) => (current === "fast" ? "sharp" : "fast"))}
+        >
+          {viewerScaleForSession(scale, !!live) === "fast" ? "Sharp" : "Fast"}
+        </button>
+        {onToggleFullscreen ? (
+          <button type="button" className="viewer-expand" onClick={onToggleFullscreen}>
+            {fullscreen ? "Exit fullscreen" : "Fullscreen"}
+          </button>
+        ) : null}
+      </div>
       <p className="viewer-hint">{hint}</p>
     </div>
   );

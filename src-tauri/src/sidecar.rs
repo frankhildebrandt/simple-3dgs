@@ -346,8 +346,14 @@ fn write_fake_frames(spec: &CommandSpec) -> Result<(), PipelineError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
     std::fs::create_dir_all(dir)?;
+    let img = image::RgbImage::from_fn(16, 16, |x, y| {
+        let v = if (x + y) % 2 == 0 { 30 } else { 220 };
+        image::Rgb([v, v, v])
+    });
     for i in 1..=8 {
-        std::fs::write(dir.join(format!("frame_{i:05}.{ext}")), b"fake-frame")?;
+        let dest = dir.join(format!("frame_{i:05}.{ext}"));
+        img.save(&dest)
+            .map_err(|err| PipelineError::message(format!("fake frame write failed: {err}")))?;
     }
     Ok(())
 }

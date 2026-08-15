@@ -10,6 +10,7 @@ use crate::colmap;
 use crate::error::PipelineError;
 use crate::ffmpeg;
 use crate::geo::{self, GeoFix};
+use crate::keyframes::{self, KeyframeConfig};
 use crate::project::{
     assemble_dataset, count_frames, finalize_ply, ProjectLayout, Stage, MIN_FRAMES,
 };
@@ -192,21 +193,7 @@ fn run_frames(
     match config.kind {
         InputKind::Video => {
             let video = copy_input_video(&config.source, &layout.input_dir())?;
-            let spec = ffmpeg::extract_spec(&video, &layout.frames_dir(), config.settings);
-            match run_logged(runner, &spec, events) {
-                Ok(()) => {}
-                Err(_) => {
-                    events
-                        .log("VideoToolbox decode failed, retrying without hardware acceleration");
-                    let fallback = ffmpeg::extract_spec_with_hwaccel(
-                        &video,
-                        &layout.frames_dir(),
-                        config.settings,
-                        false,
-                    );
-                    run_logged(runner, &fallback, events)?;
-                }
-            }
+            extract_video_keyframes(&video, layout, config.settings, runner, events)?;
         }
         InputKind::Images => {
             import_image_folder(&config.source, &layout.frames_dir())?;
@@ -222,6 +209,67 @@ fn run_frames(
     layout.mark_complete(Stage::Frames)?;
     events.progress(Stage::Frames, 100, &format!("Extracted {n} frames"));
     Ok(())
+}
+
+/// Dense thumbs → score → full-res stills at the selected indices.
+fn extract_video_keyframes(
+    video: &Path,
+    layout: &ProjectLayout,
+    settings: PipelineSettings,
+    runner: &mut dyn SidecarRunner,
+    events: &mut dyn PipelineEvents,
+) -> Result<(), PipelineError> {
+    let candidates = layout.candidates_dir();
+    let _ = fs::remove_dir_all(&candidates);
+    fs::create_dir_all(&candidates)?;
+    events.progress(Stage::Frames, 15, "Extracting candidate frames");
+    run_ffmpeg_extract(
+        runner,
+        events,
+        ffmpeg::candidate_spec(video, &candidates, settings),
+        ffmpeg::candidate_spec_with_hwaccel(video, &candidates, settings, false),
+    )?;
+
+    events.progress(Stage::Frames, 55, "Selecting keyframes");
+    let scores = keyframes::score_candidates(&candidates)?;
+    let picked = keyframes::select_keyframes(&scores, KeyframeConfig::from_settings(settings));
+    if picked.is_empty() {
+        let _ = fs::remove_dir_all(&candidates);
+        return Err(PipelineError::message(
+            "Could not select keyframes from the video. Try a longer clip.",
+        ));
+    }
+
+    let _ = fs::remove_dir_all(layout.frames_dir());
+    fs::create_dir_all(layout.frames_dir())?;
+    events.progress(
+        Stage::Frames,
+        70,
+        &format!("Extracting {} keyframes", picked.len()),
+    );
+    let result = run_ffmpeg_extract(
+        runner,
+        events,
+        ffmpeg::select_spec(video, &layout.frames_dir(), settings, &picked),
+        ffmpeg::select_spec_with_hwaccel(video, &layout.frames_dir(), settings, &picked, false),
+    );
+    let _ = fs::remove_dir_all(&candidates);
+    result
+}
+
+fn run_ffmpeg_extract(
+    runner: &mut dyn SidecarRunner,
+    events: &mut dyn PipelineEvents,
+    primary: CommandSpec,
+    fallback: CommandSpec,
+) -> Result<(), PipelineError> {
+    match run_logged(runner, &primary, events) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            events.log("VideoToolbox decode failed, retrying without hardware acceleration");
+            run_logged(runner, &fallback, events)
+        }
+    }
 }
 
 fn run_colmap(
@@ -502,6 +550,15 @@ mod tests {
         assert!(outcome.archive_id.is_some());
         let sidecars: Vec<_> = runner.calls.iter().map(|c| c.sidecar).collect();
         assert_eq!(sidecars[0], "ffmpeg");
+        assert_eq!(
+            runner
+                .calls
+                .iter()
+                .filter(|c| c.sidecar == "ffmpeg" && !c.args.iter().any(|a| a == "ffmetadata"))
+                .count(),
+            2,
+            "video extract is two FFmpeg passes"
+        );
         assert!(sidecars.contains(&"colmap"));
         assert!(sidecars.contains(&"brush"));
         assert_eq!(
@@ -544,7 +601,7 @@ mod tests {
         let mut events2 = CollectingEvents::new();
         run_pipeline(&config, &mut runner2, &CancelFlag::new(), &mut events2).unwrap();
         assert!(runner2.calls.is_empty(), "resume must not re-run sidecars");
-        assert_eq!(first, 6, "extract + 3 colmap + brush + geo probe");
+        assert_eq!(first, 7, "2 extract + 3 colmap + brush + geo probe");
     }
 
     #[test]

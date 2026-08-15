@@ -11,7 +11,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::error::PipelineError;
 use crate::geo::GeoFix;
-use crate::project::{first_frame, OUTPUT_PLY, VIEW_JSON};
+use crate::project::{first_frame, OUTPUT_PLY, OUTPUT_SPZ, VIEW_JSON};
 use crate::settings::PipelineSettings;
 
 pub const LIBRARY_FILE: &str = "library.json";
@@ -51,6 +51,7 @@ pub struct ArchiveEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poster_path: Option<String>,
     pub dir: String,
+    pub has_ply: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -135,6 +136,10 @@ impl ArchiveLibrary {
         if request.ply.canonicalize().ok() != ply_dest.canonicalize().ok() {
             fs::copy(request.ply, &ply_dest)?;
         }
+        let stale_spz = dest.join(OUTPUT_SPZ);
+        if stale_spz.is_file() {
+            fs::remove_file(&stale_spz)?;
+        }
         if let Some(parent) = request.ply.parent() {
             let view = parent.join(VIEW_JSON);
             if view.is_file() {
@@ -155,12 +160,122 @@ impl ArchiveLibrary {
             geo: request.geo,
             poster: poster.clone(),
         };
-        fs::write(
-            dest.join(META_FILE),
-            serde_json::to_vec_pretty(&meta).map_err(json_err)?,
-        )?;
+        self.write_meta(&meta)?;
         self.append_id(&id)?;
         Ok(self.get(&id)?)
+    }
+
+    /// Updates the display title. The folder id stays the same.
+    pub fn rename(&self, id: &str, title: &str) -> Result<ArchiveEntry, PipelineError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(PipelineError::message("Title cannot be empty."));
+        }
+        let mut entry = self.get(id)?;
+        entry.meta.title = title.to_string();
+        self.write_meta(&entry.meta)?;
+        self.get(id)
+    }
+
+    /// Deletes the entry folder and drops it from the library index.
+    pub fn remove(&self, id: &str) -> Result<(), PipelineError> {
+        let entry = self.get(id)?;
+        fs::remove_dir_all(&entry.dir)?;
+        let mut index = self.read_index()?;
+        index.ids.retain(|existing| existing != id);
+        self.write_index(&index)
+    }
+
+    /// Replaces the poster with a JPEG screenshot from the viewer.
+    pub fn set_poster(&self, id: &str, jpeg: &[u8]) -> Result<ArchiveEntry, PipelineError> {
+        if jpeg.is_empty() {
+            return Err(PipelineError::message("Preview image is empty."));
+        }
+        let entry = self.get(id)?;
+        let dir = PathBuf::from(&entry.dir);
+        let png = dir.join(POSTER_PNG);
+        if png.is_file() {
+            fs::remove_file(&png)?;
+        }
+        fs::write(dir.join(POSTER_JPG), jpeg)?;
+        let mut meta = entry.meta;
+        meta.poster = Some(POSTER_JPG.to_string());
+        self.write_meta(&meta)?;
+        self.get(id)
+    }
+
+    /// True when `{dir}/scene.spz` exists and is at least as new as `scene.ply`.
+    /// SPZ-only entries are already compressed, so they count as fresh.
+    pub fn spz_is_fresh(&self, id: &str) -> Result<bool, PipelineError> {
+        let entry = self.get(id)?;
+        let spz = Path::new(&entry.dir).join(OUTPUT_SPZ);
+        if !spz.is_file() {
+            return Ok(false);
+        }
+        if !entry.has_ply {
+            return Ok(true);
+        }
+        let ply = Path::new(&entry.dir).join(OUTPUT_PLY);
+        let ply_mtime = fs::metadata(ply)?.modified()?;
+        let spz_mtime = fs::metadata(&spz)?.modified()?;
+        Ok(spz_mtime >= ply_mtime)
+    }
+
+    /// Atomically replaces the derived SPZ cache for an archive entry.
+    pub fn write_spz(&self, id: &str, bytes: &[u8]) -> Result<(), PipelineError> {
+        if bytes.is_empty() {
+            return Err(PipelineError::message(
+                "Cannot cache SPZ: encoder returned no data.",
+            ));
+        }
+        let entry = self.get(id)?;
+        let dest = Path::new(&entry.dir).join(OUTPUT_SPZ);
+        let tmp = dest.with_extension("spz.tmp");
+        fs::write(&tmp, bytes)?;
+        fs::rename(&tmp, dest)?;
+        Ok(())
+    }
+
+    /// Copies the cached `scene.spz` to a user-chosen path.
+    pub fn export_spz(&self, id: &str, dest: &Path) -> Result<(), PipelineError> {
+        let entry = self.get(id)?;
+        let src = Path::new(&entry.dir).join(OUTPUT_SPZ);
+        if !src.is_file() {
+            return Err(PipelineError::message(
+                "Cannot export SPZ: scene.spz is missing.",
+            ));
+        }
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::copy(&src, dest)?;
+        Ok(())
+    }
+
+    /// Drops `scene.ply` after a valid `scene.spz` exists, shrinking the archive.
+    pub fn drop_uncompressed_ply(&self, id: &str) -> Result<ArchiveEntry, PipelineError> {
+        let entry = self.get(id)?;
+        let dir = PathBuf::from(&entry.dir);
+        let ply = dir.join(OUTPUT_PLY);
+        let spz = dir.join(OUTPUT_SPZ);
+        if !ply.is_file() {
+            return Ok(entry);
+        }
+        let spz_bytes = match fs::metadata(&spz) {
+            Ok(meta) if meta.len() > 0 => meta.len(),
+            _ => {
+                return Err(PipelineError::message(
+                    "Cannot convert to SPZ: scene.spz is missing.",
+                ));
+            }
+        };
+        fs::remove_file(&ply)?;
+        let mut meta = entry.meta;
+        meta.ply_bytes = spz_bytes;
+        self.write_meta(&meta)?;
+        self.get(id)
     }
 
     pub fn export_3dgs(&self, id: &str, dest: &Path) -> Result<(), PipelineError> {
@@ -169,9 +284,13 @@ impl ArchiveLibrary {
         let file = fs::File::create(dest)?;
         let mut zip = ZipWriter::new(file);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        for name in [META_FILE, OUTPUT_PLY] {
-            add_zip_file(&mut zip, &src.join(name), name, opts)?;
-        }
+        add_zip_file(&mut zip, &src.join(META_FILE), META_FILE, opts)?;
+        let splat = if src.join(OUTPUT_PLY).is_file() {
+            OUTPUT_PLY
+        } else {
+            OUTPUT_SPZ
+        };
+        add_zip_file(&mut zip, &src.join(splat), splat, opts)?;
         if src.join(VIEW_JSON).is_file() {
             add_zip_file(&mut zip, &src.join(VIEW_JSON), VIEW_JSON, opts)?;
         }
@@ -211,11 +330,13 @@ impl ArchiveLibrary {
         let meta_path = find_meta(&tmp)?;
         let mut meta: ArchiveMeta =
             serde_json::from_slice(&fs::read(&meta_path)?).map_err(json_err)?;
-        let ply_src = meta_path.parent().unwrap_or(&tmp).join(OUTPUT_PLY);
-        if !ply_src.is_file() {
+        let splat_src = meta_path.parent().unwrap_or(&tmp);
+        let ply_src = splat_src.join(OUTPUT_PLY);
+        let spz_src = splat_src.join(OUTPUT_SPZ);
+        if !ply_src.is_file() && !spz_src.is_file() {
             let _ = fs::remove_dir_all(&tmp);
             return Err(PipelineError::message(
-                "The .3dgs file is missing scene.ply.",
+                "The .3dgs file is missing scene.ply or scene.spz.",
             ));
         }
         let mut index = self.read_index()?;
@@ -228,8 +349,13 @@ impl ArchiveLibrary {
             fs::remove_dir_all(&dest)?;
         }
         fs::create_dir_all(&dest)?;
-        fs::copy(&ply_src, dest.join(OUTPUT_PLY))?;
-        let view_src = meta_path.parent().unwrap_or(&tmp).join(VIEW_JSON);
+        if ply_src.is_file() {
+            fs::copy(&ply_src, dest.join(OUTPUT_PLY))?;
+        }
+        if spz_src.is_file() {
+            fs::copy(&spz_src, dest.join(OUTPUT_SPZ))?;
+        }
+        let view_src = splat_src.join(VIEW_JSON);
         if view_src.is_file() {
             fs::copy(&view_src, dest.join(VIEW_JSON))?;
         }
@@ -239,7 +365,12 @@ impl ArchiveLibrary {
                 fs::copy(&src_poster, dest.join(poster))?;
             }
         }
-        let ply_bytes = fs::metadata(dest.join(OUTPUT_PLY))?.len();
+        let splat = if dest.join(OUTPUT_PLY).is_file() {
+            dest.join(OUTPUT_PLY)
+        } else {
+            dest.join(OUTPUT_SPZ)
+        };
+        let ply_bytes = fs::metadata(splat)?.len();
         meta.ply_bytes = ply_bytes;
         fs::write(
             dest.join(META_FILE),
@@ -262,9 +393,15 @@ impl ArchiveLibrary {
         }
         let meta: ArchiveMeta = serde_json::from_slice(&fs::read(meta_path)?).map_err(json_err)?;
         let ply = dir.join(OUTPUT_PLY);
-        if !ply.is_file() {
+        let spz = dir.join(OUTPUT_SPZ);
+        let has_ply = ply.is_file();
+        let splat = if has_ply {
+            ply
+        } else if spz.is_file() {
+            spz
+        } else {
             return Ok(None);
-        }
+        };
         let poster_path = meta
             .poster
             .as_ref()
@@ -273,9 +410,10 @@ impl ArchiveLibrary {
             .map(|path| path.to_string_lossy().into_owned());
         Ok(Some(ArchiveEntry {
             meta,
-            ply_path: ply.to_string_lossy().into_owned(),
+            ply_path: splat.to_string_lossy().into_owned(),
             poster_path,
             dir: dir.to_string_lossy().into_owned(),
+            has_ply,
         }))
     }
 
@@ -305,6 +443,14 @@ impl ArchiveLibrary {
             index.ids.push(id.to_string());
             self.write_index(&index)?;
         }
+        Ok(())
+    }
+
+    fn write_meta(&self, meta: &ArchiveMeta) -> Result<(), PipelineError> {
+        fs::write(
+            self.entry_dir(&meta.id).join(META_FILE),
+            serde_json::to_vec_pretty(meta).map_err(json_err)?,
+        )?;
         Ok(())
     }
 }
@@ -511,6 +657,7 @@ mod tests {
         assert_eq!(entry.meta.frame_count, 8);
         assert_eq!(entry.meta.geo.as_ref().unwrap().lat, 52.52);
         assert_eq!(entry.meta.poster.as_deref(), Some("poster.jpg"));
+        assert!(entry.has_ply);
         assert_eq!(lib.list().unwrap().len(), 1);
         assert!(!entry.meta.id.contains('/'));
     }
@@ -623,5 +770,229 @@ mod tests {
         let other = ArchiveLibrary::open(dir.path().join("other")).unwrap();
         let imported = other.import_3dgs(&zip_path).unwrap();
         assert!(Path::new(&imported.dir).join(VIEW_JSON).is_file());
+    }
+
+    #[test]
+    fn rename_updates_title_not_id() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let id = entry.meta.id.clone();
+        let renamed = lib.rename(&id, "  Gate  ").unwrap();
+        assert_eq!(renamed.meta.id, id);
+        assert_eq!(renamed.meta.title, "Gate");
+        assert_eq!(lib.get(&id).unwrap().meta.title, "Gate");
+    }
+
+    #[test]
+    fn rename_rejects_blank_title() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let err = lib.rename(&entry.meta.id, "   ").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("empty"));
+        assert_eq!(lib.get(&entry.meta.id).unwrap().meta.title, "Brandenburg");
+    }
+
+    #[test]
+    fn remove_drops_folder_and_index() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let folder = PathBuf::from(&entry.dir);
+        lib.remove(&entry.meta.id).unwrap();
+        assert!(lib.list().unwrap().is_empty());
+        assert!(!folder.exists());
+        assert!(lib.get(&entry.meta.id).is_err());
+    }
+
+    #[test]
+    fn remove_missing_id_errors() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let err = lib.remove("nope").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn set_poster_writes_jpeg_and_drops_png() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let folder = PathBuf::from(&entry.dir);
+        fs::write(folder.join(POSTER_PNG), b"old-png").unwrap();
+        fs::remove_file(folder.join(POSTER_JPG)).unwrap();
+        let mut meta = entry.meta.clone();
+        meta.poster = Some(POSTER_PNG.to_string());
+        lib.write_meta(&meta).unwrap();
+
+        let updated = lib.set_poster(&meta.id, b"jpeg-bytes").unwrap();
+        assert_eq!(updated.meta.poster.as_deref(), Some("poster.jpg"));
+        assert_eq!(fs::read(folder.join(POSTER_JPG)).unwrap(), b"jpeg-bytes");
+        assert!(!folder.join(POSTER_PNG).exists());
+        assert!(updated.poster_path.unwrap().ends_with("poster.jpg"));
+    }
+
+    #[test]
+    fn set_poster_rejects_empty_bytes() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let err = lib.set_poster(&entry.meta.id, b"").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("empty"));
+    }
+
+    #[test]
+    fn spz_cache_is_stale_until_written() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        assert!(!lib.spz_is_fresh(&entry.meta.id).unwrap());
+        lib.write_spz(&entry.meta.id, b"spz-bytes").unwrap();
+        assert!(lib.spz_is_fresh(&entry.meta.id).unwrap());
+        assert_eq!(
+            fs::read(Path::new(&entry.dir).join(OUTPUT_SPZ)).unwrap(),
+            b"spz-bytes"
+        );
+    }
+
+    #[test]
+    fn replacing_ply_invalidates_spz_cache() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        lib.write_spz(&entry.meta.id, b"spz-bytes").unwrap();
+        fs::write(Path::new(&entry.ply_path), b"ply\nnewer\n").unwrap();
+        assert!(!lib.spz_is_fresh(&entry.meta.id).unwrap());
+    }
+
+    #[test]
+    fn ingest_reuse_drops_stale_spz() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let first = ingest_ply(&lib, dir.path(), "a.ply");
+        lib.write_spz(&first.meta.id, b"old-spz").unwrap();
+        let ply = dir.path().join("b.ply");
+        fs::write(&ply, b"ply\nnew\n").unwrap();
+        lib.ingest(IngestRequest {
+            ply: &ply,
+            frames_dir: None,
+            source: Path::new("/clips/Brandenburg.MOV"),
+            source_kind: "video",
+            settings: None,
+            frame_count: 9,
+            geo: None,
+            reuse_id: Some(first.meta.id.clone()),
+        })
+        .unwrap();
+        assert!(!Path::new(&first.dir).join(OUTPUT_SPZ).is_file());
+    }
+
+    #[test]
+    fn write_spz_rejects_empty_bytes() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let err = lib.write_spz(&entry.meta.id, b"").unwrap_err();
+        assert!(err.to_string().contains("no data"));
+    }
+
+    #[test]
+    fn export_spz_copies_cache() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        lib.write_spz(&entry.meta.id, b"spz-bytes").unwrap();
+        let dest = dir.path().join("share").join("gate.spz");
+        lib.export_spz(&entry.meta.id, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"spz-bytes");
+    }
+
+    #[test]
+    fn export_spz_requires_cache() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let err = lib
+            .export_spz(&entry.meta.id, &dir.path().join("out.spz"))
+            .unwrap_err();
+        assert!(err.to_string().contains("scene.spz is missing"));
+    }
+
+    #[test]
+    fn zip_export_does_not_include_spz_cache() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        lib.write_spz(&entry.meta.id, b"spz-bytes").unwrap();
+        let zip_path = dir.path().join("scene.3dgs");
+        lib.export_3dgs(&entry.meta.id, &zip_path).unwrap();
+        let file = fs::File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.contains(&OUTPUT_PLY.to_string()));
+        assert!(!names.iter().any(|name| name.ends_with(OUTPUT_SPZ)));
+    }
+
+    #[test]
+    fn drop_ply_keeps_spz_and_updates_size() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        lib.write_spz(&entry.meta.id, b"spz-bytes").unwrap();
+        let converted = lib.drop_uncompressed_ply(&entry.meta.id).unwrap();
+        assert!(!converted.has_ply);
+        assert!(converted.ply_path.ends_with(OUTPUT_SPZ));
+        assert_eq!(converted.meta.ply_bytes, 9);
+        assert!(!Path::new(&entry.dir).join(OUTPUT_PLY).is_file());
+        assert!(Path::new(&entry.dir).join(OUTPUT_SPZ).is_file());
+        assert!(lib.spz_is_fresh(&entry.meta.id).unwrap());
+    }
+
+    #[test]
+    fn drop_ply_without_spz_fails() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let err = lib.drop_uncompressed_ply(&entry.meta.id).unwrap_err();
+        assert!(err.to_string().contains("scene.spz is missing"));
+        assert!(Path::new(&entry.ply_path).is_file());
+    }
+
+    #[test]
+    fn drop_ply_is_idempotent_when_already_spz() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        lib.write_spz(&entry.meta.id, b"spz-bytes").unwrap();
+        lib.drop_uncompressed_ply(&entry.meta.id).unwrap();
+        let again = lib.drop_uncompressed_ply(&entry.meta.id).unwrap();
+        assert!(!again.has_ply);
+        assert_eq!(fs::read(Path::new(&entry.dir).join(OUTPUT_SPZ)).unwrap(), b"spz-bytes");
+    }
+
+    #[test]
+    fn zip_roundtrip_preserves_spz_only_entry() {
+        let dir = tempdir().unwrap();
+        let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
+        let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        lib.write_spz(&entry.meta.id, b"spz-bytes").unwrap();
+        lib.drop_uncompressed_ply(&entry.meta.id).unwrap();
+        let zip_path = dir.path().join("scene.3dgs");
+        lib.export_3dgs(&entry.meta.id, &zip_path).unwrap();
+        let file = fs::File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.contains(&OUTPUT_SPZ.to_string()));
+        assert!(!names.contains(&OUTPUT_PLY.to_string()));
+        drop(archive);
+        let other = ArchiveLibrary::open(dir.path().join("other")).unwrap();
+        let imported = other.import_3dgs(&zip_path).unwrap();
+        assert!(!imported.has_ply);
+        assert_eq!(fs::read(Path::new(&imported.dir).join(OUTPUT_SPZ)).unwrap(), b"spz-bytes");
     }
 }
