@@ -24,6 +24,8 @@ pub struct ViewerKnobs {
     pub webview_lod_splat_count: u32,
     pub min_alpha: f64,
     pub max_std_dev: f64,
+    /// Spark and the UI use `clipXY`; serde camelCase would otherwise emit `clipXy`.
+    #[serde(rename = "clipXY", alias = "clipXy")]
     pub clip_xy: f64,
     pub min_pixel_radius: f64,
     pub min_sort_interval_ms: u32,
@@ -105,5 +107,48 @@ impl ViewerKnobs {
             move_speed: self.move_speed.max(0.01),
             far_multiplier: self.far_multiplier.max(1.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frontend and Spark spell the acronym `clipXY`; serde camelCase would emit `clipXy`.
+    const TS_VIEWER: &str = r#"{
+        "lodAbove": 100000,
+        "lodSplatScale": 1.0,
+        "lodRenderScale": 1.5,
+        "behindFoveate": 0.2,
+        "coneFoveate": 0.5,
+        "webviewLodSplatCount": 1500000,
+        "minAlpha": 0.002,
+        "maxStdDev": 2.236,
+        "clipXY": 1.2,
+        "minPixelRadius": 1.0,
+        "minSortIntervalMs": 8,
+        "fov": 60.0,
+        "moveSpeed": 0.8,
+        "farMultiplier": 40.0
+    }"#;
+
+    #[test]
+    fn deserializes_spark_clip_xy_acronym() {
+        let knobs: ViewerKnobs = serde_json::from_str(TS_VIEWER).unwrap();
+        assert_eq!(knobs.clip_xy, 1.2);
+    }
+
+    #[test]
+    fn serializes_spark_clip_xy_acronym() {
+        let json = serde_json::to_string(&ViewerKnobs::for_capture(CaptureMode::Object)).unwrap();
+        assert!(json.contains("\"clipXY\""), "{json}");
+        assert!(!json.contains("\"clipXy\""), "{json}");
+    }
+
+    #[test]
+    fn accepts_legacy_serde_camel_case_clip_xy() {
+        let json = TS_VIEWER.replace("clipXY", "clipXy");
+        let knobs: ViewerKnobs = serde_json::from_str(&json).unwrap();
+        assert_eq!(knobs.clip_xy, 1.2);
     }
 }

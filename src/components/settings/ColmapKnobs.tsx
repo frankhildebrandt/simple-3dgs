@@ -1,4 +1,10 @@
-import type { ColmapCameraModel, ColmapMatcher, ColmapMapper, PipelineSettings } from "../../types";
+import type {
+  ColmapCameraModel,
+  ColmapMatcher,
+  ColmapMapper,
+  PipelineSettings,
+  SiftBackend,
+} from "../../types";
 import { SAFETY } from "../../safety";
 import { Knob } from "./Knob";
 
@@ -27,6 +33,30 @@ export function ColmapKnobs({ value, disabled, onChange }: Props) {
   return (
     <fieldset disabled={disabled}>
       <legend>Reconstruction</legend>
+      <label
+        className="format"
+        title="Metal uses the GPU for SIFT extract and matching. CPU is VLFeat extract plus Eigen matching. Metal needs the colmap-metal sidecar."
+        data-hint="Metal uses the GPU for SIFT extract and matching. CPU is VLFeat extract plus Eigen matching. Metal needs the colmap-metal sidecar."
+      >
+        <span>SIFT</span>
+        <div className="row">
+          <button
+            type="button"
+            className={colmap.siftBackend === "cpu" ? "selected" : ""}
+            onClick={() => patch("siftBackend", "cpu" satisfies SiftBackend)}
+          >
+            CPU
+          </button>
+          <button
+            type="button"
+            className={colmap.siftBackend === "metal" ? "selected" : ""}
+            onClick={() => patch("siftBackend", "metal" satisfies SiftBackend)}
+          >
+            Metal
+          </button>
+        </div>
+        <output>{colmap.siftBackend}</output>
+      </label>
       <Knob
         label="Match overlap"
         hint="How many neighboring frames sequential matching considers."

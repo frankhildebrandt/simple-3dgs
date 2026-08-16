@@ -9,11 +9,13 @@ VENDOR="$ROOT/vendor"
 TRIPLE="${TRIPLE:-aarch64-apple-darwin}"
 BRUSH_REF="${BRUSH_REF:-main}"
 FFMPEG_VERSION="${FFMPEG_VERSION:-7.1.1}"
+COLMAP_METAL_SHA="${COLMAP_METAL_SHA:-bf01a458b958fbe31fcb67643c44e873e6ec2dd0}"
 
 STUB=0
 BUNDLE=0
 LGPL_FFMPEG=0
 BUILD_BRUSH=0
+BUILD_COLMAP_METAL=0
 
 usage() {
   cat <<'EOF'
@@ -23,9 +25,10 @@ Usage: scripts/fetch-sidecars.sh [options]
   --bundle         Copy Homebrew ffmpeg/colmap and make them relocatable
   --lgpl-ffmpeg    Compile an LGPL FFmpeg with VideoToolbox (no --enable-gpl)
   --brush          Clone and cargo-build Brush CLI at BRUSH_REF
-  --all            --bundle --lgpl-ffmpeg --brush
+  --colmap-metal   Build COLMAP with Metal SIFT (replaces the Homebrew bottle)
+  --all            --lgpl-ffmpeg --brush --colmap-metal
 
-Environment: TRIPLE, BRUSH_REF, FFMPEG_VERSION
+Environment: TRIPLE, BRUSH_REF, FFMPEG_VERSION, COLMAP_METAL_SHA
 EOF
 }
 
@@ -39,7 +42,8 @@ while [[ $# -gt 0 ]]; do
     --bundle) BUNDLE=1 ;;
     --lgpl-ffmpeg) LGPL_FFMPEG=1 ;;
     --brush) BUILD_BRUSH=1 ;;
-    --all) BUNDLE=1; LGPL_FFMPEG=1; BUILD_BRUSH=1 ;;
+    --colmap-metal) BUILD_COLMAP_METAL=1 ;;
+    --all) LGPL_FFMPEG=1; BUILD_BRUSH=1; BUILD_COLMAP_METAL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -139,12 +143,126 @@ relocate_colmap() {
 
 need_brew() {
   if ! command -v brew >/dev/null 2>&1; then
-    echo "Homebrew is required for --bundle. Install from https://brew.sh" >&2
+    echo "Homebrew is required for --bundle / --colmap-metal. Install from https://brew.sh" >&2
     exit 1
   fi
 }
 
-if [[ "$STUB" -eq 1 && "$BUNDLE" -eq 0 && "$LGPL_FFMPEG" -eq 0 && "$BUILD_BRUSH" -eq 0 ]]; then
+# `xcrun metal` needs full Xcode plus the Metal Toolchain component (Xcode 26+).
+need_metal_compiler() {
+  local dev
+  dev="$(xcode-select -p 2>/dev/null || true)"
+  if [[ "$dev" != *"/Xcode.app/"* ]]; then
+    echo "COLMAP Metal needs full Xcode (not Command Line Tools). $dev" >&2
+    echo "Install Xcode from the App Store, then:" >&2
+    echo "  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2
+    echo "  sudo xcodebuild -license accept" >&2
+    echo "  xcodebuild -runFirstLaunch" >&2
+    echo "  xcodebuild -downloadComponent MetalToolchain" >&2
+    exit 1
+  fi
+  local metal_err
+  metal_err="$(xcrun -sdk macosx metal 2>&1 || true)"
+  if echo "$metal_err" | grep -qi "missing Metal Toolchain"; then
+    echo "Xcode is selected, but the Metal shader compiler is a separate component." >&2
+    echo "Run:" >&2
+    echo "  xcodebuild -runFirstLaunch" >&2
+    echo "  xcodebuild -downloadComponent MetalToolchain" >&2
+    echo "Or Xcode → Settings → Components → Metal Toolchain." >&2
+    echo "Until then, keep SIFT on CPU or use ./scripts/fetch-sidecars.sh --bundle." >&2
+    exit 1
+  fi
+  if ! xcrun -sdk macosx -find metal >/dev/null 2>&1; then
+    echo "xcrun cannot find the metal compiler under $dev" >&2
+    exit 1
+  fi
+}
+
+# Build the Metal-SIFT COLMAP fork, relocate dylibs, and drop sift.metallib in colmap-libs.
+build_colmap_metal() {
+  need_brew
+  need_metal_compiler
+  brew list cmake >/dev/null 2>&1 || brew install cmake
+  brew list ninja >/dev/null 2>&1 || brew install ninja
+  brew list colmap >/dev/null 2>&1 || brew install colmap
+  brew list dylibbundler >/dev/null 2>&1 || brew install dylibbundler
+
+  local src="$VENDOR/colmap-metal"
+  local patch="$ROOT/scripts/patches/sift-metal-metallib-path.patch"
+  if [[ ! -d "$src/.git" ]]; then
+    git clone https://github.com/byplay-io/colmap-metal.git "$src"
+  fi
+  git -C "$src" fetch origin "$COLMAP_METAL_SHA" --depth 1 || git -C "$src" fetch origin
+  git -C "$src" checkout --force "$COLMAP_METAL_SHA"
+  git -C "$src" reset --hard "$COLMAP_METAL_SHA"
+  git -C "$src" apply "$patch"
+  git -C "$src" apply "$ROOT/scripts/patches/faiss-cpu-matcher-index-flat.patch"
+  git -C "$src" apply "$ROOT/scripts/patches/sift-metal-matcher.patch"
+
+  local build="$src/build-simple-3dgs"
+  local prefix="$VENDOR/colmap-metal-prefix"
+  rm -rf "$build"
+  mkdir -p "$build" "$prefix"
+  local generator=()
+  if command -v ninja >/dev/null 2>&1; then
+    generator=(-G Ninja)
+  fi
+  local openmp=()
+  if [[ -d "$(brew --prefix libomp 2>/dev/null || true)" ]]; then
+    openmp=(-DOpenMP_ROOT="$(brew --prefix libomp)")
+  fi
+  # Homebrew FAISS 1.15 headers shadow FetchContent FAISS (`-isystem /opt/homebrew/include`
+  # before `_deps/faiss-src`). The Index vtable then disagrees and matcher `add` SIGSEGVs.
+  cmake -S "$src" -B "$build" \
+    "${generator[@]}" \
+    "${openmp[@]}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$prefix" \
+    -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+    -DCMAKE_CXX_FLAGS="-I${build}/_deps/faiss-src" \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DMETAL_ENABLED=ON \
+    -DCUDA_ENABLED=OFF \
+    -DGUI_ENABLED=OFF \
+    -DOPENGL_ENABLED=OFF \
+    -DONNX_ENABLED=OFF \
+    -DCGAL_ENABLED=OFF \
+    -DMVS_ENABLED=OFF \
+    -DLSD_ENABLED=OFF \
+    -DDOWNLOAD_ENABLED=OFF \
+    -DTESTS_ENABLED=OFF
+  cmake --build "$build" --parallel "$(sysctl -n hw.ncpu)"
+  cmake --install "$build"
+
+  local dest="$BINARIES/colmap-${TRIPLE}"
+  if [[ ! -x "$prefix/bin/colmap" ]]; then
+    echo "COLMAP Metal binary not found at $prefix/bin/colmap" >&2
+    exit 1
+  fi
+  cp "$prefix/bin/colmap" "$dest"
+  chmod +x "$dest"
+  relocate_colmap "$dest"
+
+  local metalib=""
+  for candidate in \
+    "$prefix/lib/sift.metallib" \
+    "$build/src/thirdparty/SiftMetal/sift.metallib"
+  do
+    if [[ -f "$candidate" ]]; then
+      metalib="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$metalib" ]]; then
+    echo "sift.metallib not found after COLMAP Metal build" >&2
+    exit 1
+  fi
+  mkdir -p "$BINARIES/colmap-libs"
+  cp "$metalib" "$BINARIES/colmap-libs/sift.metallib"
+  echo "colmap metal -> $dest (sift.metallib in colmap-libs)"
+}
+
+if [[ "$STUB" -eq 1 && "$BUNDLE" -eq 0 && "$LGPL_FFMPEG" -eq 0 && "$BUILD_BRUSH" -eq 0 && "$BUILD_COLMAP_METAL" -eq 0 ]]; then
   install_stub ffmpeg
   install_stub colmap
   install_stub brush
@@ -229,6 +347,10 @@ if [[ "$BUILD_BRUSH" -eq 1 ]]; then
   chmod +x "$BINARIES/brush-${TRIPLE}"
   popd >/dev/null
   echo "brush -> $BINARIES/brush-${TRIPLE} (from $bin)"
+fi
+
+if [[ "$BUILD_COLMAP_METAL" -eq 1 ]]; then
+  build_colmap_metal
 fi
 
 echo "Sidecars in $BINARIES:"

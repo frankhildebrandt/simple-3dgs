@@ -1,0 +1,118 @@
+diff --git a/src/colmap/feature/index.cc b/src/colmap/feature/index.cc
+index 237ce7d5..9ed95169 100644
+--- a/src/colmap/feature/index.cc
++++ b/src/colmap/feature/index.cc
+@@ -32,19 +32,18 @@
+ #include "colmap/util/logging.h"
+ 
+ #include <faiss/IndexFlat.h>
+-#include <faiss/IndexIVFFlat.h>
+-#include <faiss/IndexIVFPQ.h>
+-#include <faiss/IndexPQ.h>
+-#include <omp.h>
++
++#include <mutex>
+ 
+ namespace colmap {
+ namespace {
+ 
+ class FaissFeatureDescriptorIndex : public FeatureDescriptorIndex {
+  public:
+-  explicit FaissFeatureDescriptorIndex(int num_threads)
+-      : num_threads_(num_threads) {}
++  explicit FaissFeatureDescriptorIndex(int /*num_threads*/) {}
+ 
++  // Exact IndexFlatL2, no OpenMP around FAISS. Matcher workers are already a
++  // pthread pool; nested OpenMP/OpenBLAS teams SIGSEGV on macOS.
+   void Build(const FeatureDescriptorsFloat& index_descriptors) override {
+     type_ = index_descriptors.type;
+     if (index_descriptors.data.rows() == 0) {
+@@ -52,37 +51,10 @@ class FaissFeatureDescriptorIndex : public FeatureDescriptorIndex {
+       return;
+     }
+ 
+-#pragma omp parallel num_threads(1)
+-    {
+-      omp_set_num_threads(num_threads_);
+-#ifdef _MSC_VER
+-      omp_set_nested(1);
+-#else
+-      omp_set_max_active_levels(1);
+-#endif
+-
+-      if (index_descriptors.data.rows() >= 512) {
+-        const int num_centroids = 4 * std::sqrt(index_descriptors.data.rows());
+-        coarse_quantizer_ =
+-            std::make_unique<faiss::IndexFlatL2>(index_descriptors.data.cols());
+-        index_ = std::make_unique<faiss::IndexIVFFlat>(
+-            /*quantizer=*/coarse_quantizer_.get(),
+-            /*d=*/index_descriptors.data.cols(),
+-            /*nlist_=*/num_centroids);
+-        auto* index_impl = dynamic_cast<faiss::IndexIVFFlat*>(index_.get());
+-        // Avoid warnings during the training phase.
+-        index_impl->cp.min_points_per_centroid = 1;
+-        index_->train(index_descriptors.data.rows(),
+-                      index_descriptors.data.data());
+-        index_->add(index_descriptors.data.rows(),
+-                    index_descriptors.data.data());
+-      } else {
+-        index_ = std::make_unique<faiss::IndexFlatL2>(
+-            /*d=*/index_descriptors.data.cols());
+-        index_->add(index_descriptors.data.rows(),
+-                    index_descriptors.data.data());
+-      }
+-    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    index_ = std::make_unique<faiss::IndexFlatL2>(
++        /*d=*/index_descriptors.data.cols());
++    index_->add(index_descriptors.data.rows(), index_descriptors.data.data());
+   }
+ 
+   void Search(int num_neighbors,
+@@ -105,38 +77,32 @@ class FaissFeatureDescriptorIndex : public FeatureDescriptorIndex {
+ 
+     const int64_t num_eff_neighbors =
+         std::min<int64_t>(num_neighbors, index_->ntotal);
++    if (num_eff_neighbors <= 0) {
++      indices.resize(0, 0);
++      l2_dists.resize(0, 0);
++      return;
++    }
+ 
+     l2_dists.resize(num_query_descriptors, num_eff_neighbors);
+     Eigen::Matrix<int64_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+         indices_long(num_query_descriptors, num_eff_neighbors);
+ 
+-#pragma omp parallel num_threads(1)
+     {
+-      omp_set_num_threads(num_threads_);
+-#ifdef _MSC_VER
+-      omp_set_nested(1);
+-#else
+-      omp_set_max_active_levels(1);
+-#endif
+-
+-      faiss::SearchParametersIVF search_params;
+-      search_params.nprobe = 8;
++      std::lock_guard<std::mutex> lock(mutex_);
+       index_->search(num_query_descriptors,
+                      query_descriptors.data.data(),
+                      num_eff_neighbors,
+                      l2_dists.data(),
+-                     indices_long.data(),
+-                     &search_params);
++                     indices_long.data());
+     }
+ 
+     indices = indices_long.cast<int>();
+   }
+ 
+  private:
+-  const int num_threads_;
+   FeatureExtractorType type_ = FeatureExtractorType::UNDEFINED;
+   std::unique_ptr<faiss::Index> index_;
+-  std::unique_ptr<faiss::IndexFlatL2> coarse_quantizer_;
++  mutable std::mutex mutex_;
+ };
+ 
+ }  // namespace

@@ -10,7 +10,7 @@ export type NamedPreset = "fast" | "balanced" | "quality";
 export type Preset = NamedPreset | "custom";
 
 export type { CaptureMode };
-export type { ColmapCameraModel, ColmapKnobs, ColmapMatcher, ColmapMapper } from "./colmapKnobs";
+export type { ColmapCameraModel, ColmapKnobs, ColmapMatcher, ColmapMapper, SiftBackend } from "./colmapKnobs";
 export type { BrushKnobs, ExtractKnobs, ViewerKnobs };
 export { DEFAULT_BRUSH_KNOBS } from "./brushKnobs";
 export { defaultsFor };
@@ -247,21 +247,21 @@ export type PipelineSettingsInput = Omit<
   PipelineSettings,
   "extract" | "colmap" | "brush" | "viewer"
 > & {
-  extract?: ExtractKnobs;
-  colmap?: ColmapKnobs;
-  brush?: BrushKnobs;
-  viewer?: ViewerKnobs;
+  extract?: Partial<ExtractKnobs>;
+  colmap?: Partial<ColmapKnobs>;
+  brush?: Partial<BrushKnobs>;
+  viewer?: Partial<ViewerKnobs>;
 };
 
-/** Fills missing nested groups from capture mode so legacy project JSON still matches. */
+/** Fills missing nested groups and new knob keys so legacy project JSON still matches. */
 export function hydrateSettings(settings: PipelineSettingsInput): PipelineSettings {
   const fallback = defaultsFor(settings.captureMode);
   return {
     ...settings,
-    extract: settings.extract ?? fallback.extract,
-    colmap: settings.colmap ?? fallback.colmap,
-    brush: settings.brush ?? fallback.brush,
-    viewer: settings.viewer ?? fallback.viewer,
+    extract: { ...fallback.extract, ...settings.extract },
+    colmap: { ...fallback.colmap, ...settings.colmap },
+    brush: { ...fallback.brush, ...settings.brush },
+    viewer: { ...fallback.viewer, ...settings.viewer },
   };
 }
 

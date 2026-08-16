@@ -398,6 +398,7 @@ mod tests {
         assert_eq!(colmap.mapper, crate::colmap_knobs::ColmapMapper::Global);
         assert_eq!(colmap.min_overlap_floor, 20);
         assert_eq!(colmap.matcher, crate::colmap_knobs::ColmapMatcher::Exhaustive);
+        assert_eq!(colmap.sift_backend, crate::colmap_knobs::SiftBackend::Cpu);
     }
 
     #[test]

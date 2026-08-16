@@ -8,7 +8,7 @@ use crate::settings::{FrameFormat, PipelineSettings};
 use crate::sidecar::{path_arg, CommandSpec};
 
 pub const THUMB_EDGE: u32 = 320;
-pub const FILTER_SCRIPT_MIN_INDICES: usize = 500;
+pub const FILTER_SCRIPT_MIN_CHARS: usize = 12_000;
 pub const SELECT_FILTER_FILE: &str = "select.filter";
 
 /// Builds the FFmpeg `-vf` filter for extract rate and optional longest-edge scale.
@@ -43,7 +43,9 @@ pub fn candidate_spec_with_hwaccel(
 }
 
 /// Full-resolution stills at the selected candidate indices (`n` after `fps=`).
-/// Lists of 500+ indices write `select.filter` next to the stills and use `-filter_script`.
+/// Consecutive `n` become `between()`; terms are a balanced `+` tree so FFmpeg's
+/// expr parser does not hit ENOMEM. Graphs over [`FILTER_SCRIPT_MIN_CHARS`]
+/// write `select.filter` and use `-filter_script`.
 pub fn select_spec(
     video: &Path,
     frames_dir: &Path,
@@ -146,15 +148,12 @@ fn extract_args(req: ExtractArgs<'_>) -> CommandSpec {
     CommandSpec::new("ffmpeg", args)
 }
 
-/// Writes a filter script when the select expression would overflow ARG_MAX.
+/// Writes a filter script when the graph would be a huge `-vf` argument.
 fn push_filter(args: &mut Vec<String>, req: &ExtractArgs<'_>) {
-    let use_script = req
-        .indices
-        .is_some_and(|indices| indices.len() >= FILTER_SCRIPT_MIN_INDICES);
-    if use_script {
+    let script_graph = filter_graph(req.fps, req.indices, req.max_width, false);
+    if req.indices.is_some() && script_graph.len() >= FILTER_SCRIPT_MIN_CHARS {
         let path = req.out_dir.join(SELECT_FILTER_FILE);
-        let graph = filter_graph(req.fps, req.indices, req.max_width, false);
-        if fs::write(&path, graph).is_ok() {
+        if fs::write(&path, script_graph).is_ok() {
             args.push("-filter_script".into());
             args.push(path_arg(&path));
             return;
@@ -172,18 +171,56 @@ fn filter_graph(
 ) -> String {
     let mut parts = vec![format!("fps={fps}")];
     if let Some(indices) = indices {
-        let sep = if escape_select { "\\," } else { "," };
-        let expr = indices
-            .iter()
-            .map(|index| format!("eq(n{sep}{index})"))
-            .collect::<Vec<_>>()
-            .join("+");
-        parts.push(format!("select='{expr}'"));
+        if !indices.is_empty() {
+            let sep = if escape_select { "\\," } else { "," };
+            let expr = join_select_terms(&select_terms(indices, sep));
+            parts.push(format!("select='{expr}'"));
+        }
     }
     if let Some(width) = max_width {
         parts.push(format!("scale='min(iw,{width})':-2"));
     }
     parts.join(",")
+}
+
+/// Inclusive runs of selected `n` as `eq` or `between` terms.
+fn select_terms(indices: &[usize], sep: &str) -> Vec<String> {
+    let mut sorted = indices.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut terms = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let lo = sorted[i];
+        let mut hi = lo;
+        while i + 1 < sorted.len() && sorted[i + 1] == hi + 1 {
+            i += 1;
+            hi = sorted[i];
+        }
+        if lo == hi {
+            terms.push(format!("eq(n{sep}{lo})"));
+        } else {
+            terms.push(format!("between(n{sep}{lo}{sep}{hi})"));
+        }
+        i += 1;
+    }
+    terms
+}
+
+/// Balanced `+` tree so FFmpeg's recursive expr parser stays O(log n) deep.
+fn join_select_terms(terms: &[String]) -> String {
+    match terms.len() {
+        0 => "0".into(),
+        1 => terms[0].clone(),
+        n => {
+            let mid = n / 2;
+            format!(
+                "({}+{})",
+                join_select_terms(&terms[..mid]),
+                join_select_terms(&terms[mid..])
+            )
+        }
+    }
 }
 
 fn format_seconds(value: f32) -> String {
@@ -347,11 +384,61 @@ mod tests {
     }
 
     #[test]
-    fn many_indices_use_filter_script() {
+    fn consecutive_indices_compact_to_between() {
+        let spec = select_spec(
+            Path::new("clip.mp4"),
+            Path::new("frames"),
+            balanced(),
+            &(10..=20).collect::<Vec<_>>(),
+        );
+        let vf = spec
+            .args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].as_str())
+            .unwrap();
+        assert!(vf.contains("between(n\\,10\\,20)"), "got {vf}");
+        assert!(!vf.contains("eq(n\\,11)"));
+        assert!(!spec.args.contains(&"-filter_script".into()));
+    }
+
+    #[test]
+    fn dense_tail_does_not_emit_per_frame_eq() {
+        let mut indices: Vec<usize> = (0..120).map(|i| i * 3).collect();
+        indices.extend(374..=500);
+        let spec = select_spec(Path::new("clip.mp4"), Path::new("frames"), balanced(), &indices);
+        let vf = spec
+            .args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].as_str())
+            .unwrap();
+        assert!(vf.contains("between(n\\,374\\,500)"), "got {vf}");
+        assert!(vf.contains("eq(n\\,0)"));
+        assert!(!vf.contains("eq(n\\,375)"));
+        assert!(vf.contains('('), "balanced + tree should parenthesize, got {vf}");
+    }
+
+    #[test]
+    fn many_consecutive_indices_stay_on_vf() {
+        let indices: Vec<_> = (0..500).collect();
+        let spec = select_spec(Path::new("clip.mp4"), Path::new("frames"), balanced(), &indices);
+        let vf = spec
+            .args
+            .windows(2)
+            .find(|w| w[0] == "-vf")
+            .map(|w| w[1].as_str())
+            .unwrap();
+        assert!(vf.contains("between(n\\,0\\,499)"), "got {vf}");
+        assert!(!spec.args.contains(&"-filter_script".into()));
+    }
+
+    #[test]
+    fn long_sparse_select_uses_filter_script() {
         let dir = tempdir().unwrap();
         let frames = dir.path().join("frames");
         fs::create_dir_all(&frames).unwrap();
-        let indices: Vec<_> = (0..FILTER_SCRIPT_MIN_INDICES).collect();
+        let indices: Vec<_> = (0..2_000).map(|i| i * 2).collect();
         let spec = select_spec(Path::new("clip.mp4"), &frames, balanced(), &indices);
         let script = frames.join(SELECT_FILTER_FILE);
         assert!(spec
@@ -361,7 +448,8 @@ mod tests {
         assert!(!spec.args.contains(&"-vf".into()));
         let graph = fs::read_to_string(&script).unwrap();
         assert!(graph.contains("eq(n,0)"));
-        assert!(graph.contains(&format!("eq(n,{})", FILTER_SCRIPT_MIN_INDICES - 1)));
+        assert!(graph.contains("eq(n,3998)"));
         assert!(!graph.contains("eq(n\\,0)"));
+        assert!(graph.contains('('));
     }
 }

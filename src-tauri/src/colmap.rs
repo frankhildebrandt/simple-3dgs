@@ -3,10 +3,11 @@
 //! back to sequential when the frame count exceeds `exhaustiveFrameLimit`.
 //! Flags match COLMAP 4 (`FeatureExtraction` / `FeatureMatching`, not the old `SiftExtraction.use_gpu`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::colmap_knobs::{ColmapMapper, ColmapMatcher};
-use crate::settings::PipelineSettings;
+use crate::colmap_knobs::{ColmapMapper, ColmapMatcher, SiftBackend};
+use crate::error::PipelineError;
+use crate::settings::{CaptureMode, PipelineSettings};
 use crate::sidecar::{path_arg, CommandSpec};
 
 /// Feature extraction, matching, then global or incremental mapping from knobs.
@@ -57,7 +58,11 @@ pub fn feature_extractor_spec(
         "--ImageReader.camera_model".into(),
         knobs.camera_model.as_colmap().into(),
         "--FeatureExtraction.use_gpu".into(),
-        "0".into(),
+        if knobs.sift_backend == SiftBackend::Metal {
+            "1".into()
+        } else {
+            "0".into()
+        },
     ];
     if let Some(list) = image_list {
         args.push("--image_list_path".into());
@@ -70,6 +75,34 @@ pub fn feature_extractor_spec(
     CommandSpec::new("colmap", args)
 }
 
+/// `sift.metallib` next to the sidecar, in `colmap-libs`, or in the app Resources tree.
+pub fn sift_metallib_beside(colmap_bin: &Path) -> Option<PathBuf> {
+    let dir = colmap_bin.parent()?;
+    [
+        dir.join("sift.metallib"),
+        dir.join("colmap-libs").join("sift.metallib"),
+        dir.join("..")
+            .join("Resources")
+            .join("colmap-libs")
+            .join("sift.metallib"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+/// Homebrew COLMAP aborts on Qt/Cocoa when GPU SIFT is requested without this file.
+pub fn require_metal_sidecar(colmap_bin: &Path, mode: CaptureMode) -> Result<(), PipelineError> {
+    if sift_metallib_beside(colmap_bin).is_some() {
+        Ok(())
+    } else {
+        Err(PipelineError::colmap_failed_with(
+            1,
+            "Failed to load Metal library: sift.metallib was not found next to the COLMAP sidecar",
+            mode,
+        ))
+    }
+}
+
 /// Sequential or exhaustive matching from knobs, with exhaustive falling back by frame count.
 pub fn matcher_spec(
     database: &Path,
@@ -77,7 +110,7 @@ pub fn matcher_spec(
     frame_count: usize,
 ) -> CommandSpec {
     if uses_exhaustive(settings, frame_count) {
-        exhaustive_matcher_spec(database)
+        exhaustive_matcher_spec(database, settings)
     } else {
         sequential_matcher_spec(database, settings)
     }
@@ -89,11 +122,10 @@ pub fn sequential_matcher_spec(database: &Path, settings: PipelineSettings) -> C
         "sequential_matcher".into(),
         "--database_path".into(),
         path_arg(database),
-        "--FeatureMatching.use_gpu".into(),
-        "0".into(),
-        "--SequentialMatching.overlap".into(),
-        sequential_overlap(settings).to_string(),
     ];
+    args.extend(matching_flags(knobs.sift_backend));
+    args.push("--SequentialMatching.overlap".into());
+    args.push(sequential_overlap(settings).to_string());
     if knobs.quadratic_overlap {
         args.push("--SequentialMatching.quadratic_overlap".into());
         args.push("1".into());
@@ -101,17 +133,28 @@ pub fn sequential_matcher_spec(database: &Path, settings: PipelineSettings) -> C
     CommandSpec::new("colmap", args)
 }
 
-pub fn exhaustive_matcher_spec(database: &Path) -> CommandSpec {
-    CommandSpec::new(
-        "colmap",
-        vec![
-            "exhaustive_matcher".into(),
-            "--database_path".into(),
-            path_arg(database),
+pub fn exhaustive_matcher_spec(database: &Path, settings: PipelineSettings) -> CommandSpec {
+    let mut args = vec![
+        "exhaustive_matcher".into(),
+        "--database_path".into(),
+        path_arg(database),
+    ];
+    args.extend(matching_flags(settings.colmap_knobs().sift_backend));
+    CommandSpec::new("colmap", args)
+}
+
+/// Metal matching uses the SiftMetal GPU kernel. CPU matching skips FAISS:
+/// Homebrew FAISS 1.15 headers vs bundled FAISS shift the Index vtable.
+fn matching_flags(sift: SiftBackend) -> Vec<String> {
+    match sift {
+        SiftBackend::Metal => vec!["--FeatureMatching.use_gpu".into(), "1".into()],
+        SiftBackend::Cpu => vec![
             "--FeatureMatching.use_gpu".into(),
             "0".into(),
+            "--SiftMatching.cpu_brute_force_matcher".into(),
+            "1".into(),
         ],
-    )
+    }
 }
 
 pub fn mapper_spec(
@@ -317,6 +360,10 @@ mod tests {
             .args
             .windows(2)
             .any(|w| w[0] == "--FeatureMatching.use_gpu" && w[1] == "0"));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--SiftMatching.cpu_brute_force_matcher" && w[1] == "1"));
     }
 
     #[test]
@@ -397,6 +444,33 @@ mod tests {
     }
 
     #[test]
+    fn metal_sift_sets_extraction_and_matching_gpu() {
+        let mut settings = PipelineSettings::from_preset(Preset::Fast);
+        let mut knobs = settings.colmap_knobs();
+        knobs.sift_backend = crate::colmap_knobs::SiftBackend::Metal;
+        settings.colmap = Some(knobs);
+        let spec = feature_extractor_spec(Path::new("frames"), Path::new("db"), settings, None);
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--FeatureExtraction.use_gpu" && w[1] == "1"));
+        let matcher = sequential_matcher_spec(Path::new("db"), settings);
+        assert!(matcher
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--FeatureMatching.use_gpu" && w[1] == "1"));
+        assert!(!matcher
+            .args
+            .iter()
+            .any(|a| a.contains("cpu_brute_force_matcher")));
+        let exhaustive = exhaustive_matcher_spec(Path::new("db"), settings);
+        assert!(exhaustive
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--FeatureMatching.use_gpu" && w[1] == "1"));
+    }
+
+    #[test]
     fn matcher_uses_configured_overlap_on_cpu() {
         let mut settings = PipelineSettings::from_preset(Preset::Fast);
         settings.match_overlap = 8;
@@ -409,6 +483,10 @@ mod tests {
             .args
             .windows(2)
             .any(|w| w[0] == "--FeatureMatching.use_gpu" && w[1] == "0"));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--SiftMatching.cpu_brute_force_matcher" && w[1] == "1"));
         assert!(!spec.args.iter().any(|a| a.contains("SiftMatching.use_gpu")));
     }
 
@@ -469,5 +547,39 @@ mod tests {
         assert_eq!(specs.len(), 3);
         assert_eq!(subcommand(&specs[2]), "mapper");
         assert!(specs.iter().all(|s| subcommand(s) != "global_mapper"));
+    }
+
+    #[test]
+    fn metallib_is_found_beside_colmap_libs() {
+        let root = std::env::temp_dir().join(format!(
+            "simple-3dgs-metallib-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let libs = root.join("colmap-libs");
+        std::fs::create_dir_all(&libs).unwrap();
+        std::fs::write(libs.join("sift.metallib"), b"fake").unwrap();
+        let bin = root.join("colmap-aarch64-apple-darwin");
+        std::fs::write(&bin, b"fake").unwrap();
+        let found = sift_metallib_beside(&bin).expect("metallib");
+        assert!(found.ends_with("sift.metallib"));
+        require_metal_sidecar(&bin, CaptureMode::Object).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_metallib_is_a_gpu_sift_error() {
+        let err = require_metal_sidecar(
+            Path::new("/tmp/simple-3dgs-missing-colmap"),
+            CaptureMode::Object,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("GPU SIFT"));
+        assert!(msg.contains("--colmap-metal"));
+        assert!(!msg.contains("slower orbit"));
     }
 }

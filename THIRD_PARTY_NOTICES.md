@@ -19,8 +19,14 @@ Source for the bundled build is fetched by `scripts/fetch-sidecars.sh`.
 ## COLMAP
 
 - Project: https://github.com/colmap/colmap
+- Metal SIFT fork: https://github.com/byplay-io/colmap-metal (pinned SHA in `scripts/fetch-sidecars.sh`)
 - License: BSD-3-Clause
 - Role: structure-from-motion (camera poses and sparse point cloud)
+
+`--bundle` copies a relocatable Homebrew bottle (CPU SIFT, Qt-linked).
+`--colmap-metal` / `--all` compile the Metal-SIFT fork (CPU and Metal extractors
+in one binary, GUI off). Metal shaders originate from
+[SIFTMetal](https://github.com/lukevanin/SIFTMetal) (MIT, Luke Van In).
 
 COLMAP also redistributes third-party libraries (Ceres, Boost, Eigen,
 SQLite, …) under their own permissive licenses. Those travel with the

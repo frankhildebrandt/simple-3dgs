@@ -18,8 +18,9 @@ use crate::manifest::{self, FrameEntry, FrameManifest, ProjectManifest};
 use crate::project::{
     assemble_dataset, count_frames, finalize_ply, ProjectLayout, Stage, MIN_FRAMES,
 };
+use crate::colmap_knobs::SiftBackend;
 use crate::settings::{ExtractMode, PipelineSettings};
-use crate::sidecar::{CancelFlag, CommandSpec, SidecarRunner};
+use crate::sidecar::{self, CancelFlag, CommandSpec, SidecarRunner};
 use crate::train_log::TrainSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,6 +448,12 @@ fn run_colmap(
     }
 
     events.progress(Stage::Colmap, 10, "Estimating camera poses");
+    if settings.colmap_knobs().sift_backend == SiftBackend::Metal {
+        colmap::require_metal_sidecar(
+            &sidecar::resolve_binary("colmap")?,
+            settings.sanitized().capture_mode,
+        )?;
+    }
     fs::create_dir_all(layout.sparse_dir())?;
     let selected = selected_frame_count(layout)?;
     let image_list = write_selected_image_list(layout)?;

@@ -170,6 +170,7 @@ impl SidecarRunner for ProcessRunner {
             // Brush's env_logger defaults to error; info is required to see train metrics.
             command.env("RUST_LOG", "info");
         }
+        pin_colmap_matcher_blas(&mut command, spec);
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -280,7 +281,7 @@ fn sidecar_result(
         return Ok(());
     }
     Err(match spec.sidecar {
-        "ffmpeg" => PipelineError::ffmpeg_failed(code),
+        "ffmpeg" => PipelineError::ffmpeg_failed_with(code, &detail),
         "colmap" => PipelineError::colmap_failed_with(code, &detail, spec.capture_mode),
         "brush" => PipelineError::brush_failed_with(code, &detail),
         other => PipelineError::Sidecar {
@@ -289,6 +290,19 @@ fn sidecar_result(
             hint: "The sidecar exited with an error.".into(),
         },
     })
+}
+
+/// Matcher workers are a pthread pool; FAISS/OpenBLAS OpenMP teams SIGSEGV on macOS.
+fn pin_colmap_matcher_blas(command: &mut Command, spec: &CommandSpec) {
+    if spec.sidecar == "colmap" && colmap_pins_matcher_blas(spec.args.first().map(String::as_str)) {
+        command.env("OMP_NUM_THREADS", "1");
+        command.env("OPENBLAS_NUM_THREADS", "1");
+        command.env("VECLIB_MAXIMUM_THREADS", "1");
+    }
+}
+
+fn colmap_pins_matcher_blas(subcommand: Option<&str>) -> bool {
+    subcommand.is_some_and(|sub| sub.ends_with("_matcher"))
 }
 
 fn emit_preview(spec: &CommandSpec, last: &mut Option<PathBuf>, preview: &mut dyn FnMut(&Path)) {
@@ -524,5 +538,15 @@ mod tests {
         assert_eq!(runner.calls.len(), 1);
         assert_eq!(crate::project::count_frames(dir.path()).unwrap(), 8);
         assert!(!logs.is_empty());
+    }
+
+    #[test]
+    fn matcher_subcommands_pin_blas_threads() {
+        assert!(colmap_pins_matcher_blas(Some("exhaustive_matcher")));
+        assert!(colmap_pins_matcher_blas(Some("sequential_matcher")));
+        assert!(!colmap_pins_matcher_blas(Some("feature_extractor")));
+        assert!(!colmap_pins_matcher_blas(Some("mapper")));
+        assert!(!colmap_pins_matcher_blas(Some("global_mapper")));
+        assert!(!colmap_pins_matcher_blas(None));
     }
 }

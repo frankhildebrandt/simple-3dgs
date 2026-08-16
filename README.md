@@ -32,7 +32,8 @@ If cameras do not recover, reshoot: slower, more overlap, less blur. Rooms need 
 - macOS 14+ on Apple Silicon
 - 16 GB unified memory minimum (24 GB+ is more comfortable)
 - For **building**: Node 22+, Rust 1.88+, Xcode CLT
-- For **bundling sidecars**: Homebrew (COLMAP), Rust (Brush + `tools/colmap-bundle`), network (FFmpeg source)
+- For **bundling sidecars**: Homebrew (COLMAP deps), Rust (Brush + `tools/colmap-bundle`), network (FFmpeg source, colmap-metal)
+- For **COLMAP Metal SIFT**: full **Xcode** (App Store), then `xcodebuild -runFirstLaunch` and `xcodebuild -downloadComponent MetalToolchain`. Command Line Tools are not enough — `xcrun metal` is a separate component in Xcode 26+.
 
 ## Develop
 
@@ -44,6 +45,7 @@ npm run tauri dev
 ```
 
 Stubs forward to `ffmpeg`, `colmap`, and `brush`/`brush-cli` on your PATH.
+Named presets use CPU SIFT (VLFeat). Expert/Custom can switch Reconstruction → SIFT to **Metal** (GPU, less RAM) when the sidecar is the Metal fork.
 To ship a self-contained app:
 
 ```sh
@@ -52,8 +54,9 @@ npm run tauri build
 ```
 
 `--all` compiles an **LGPL** FFmpeg with VideoToolbox (no `--enable-gpl`),
-copies a relocatable COLMAP 4.1 from Homebrew (dylibs + Qt frameworks),
-and builds Brush `brush-cli` from `main`. The resulting sidecars stay
+builds COLMAP from [colmap-metal](https://github.com/byplay-io/colmap-metal) (Metal SIFT, no Qt GUI),
+and builds Brush `brush-cli` from `main`. Metal SIFT matches on the GPU; CPU SIFT matching skips FAISS (`--SiftMatching.cpu_brute_force_matcher 1`). `./scripts/fetch-sidecars.sh --bundle` still copies
+Homebrew COLMAP for a faster CPU-only sidecar. The resulting sidecars stay
 gitignored under `src-tauri/binaries/`.
 
 ## License

@@ -77,10 +77,9 @@ pub fn train_spec(
         "--match-alpha-weight".into(),
         brush.match_alpha_weight.to_string(),
         "--background-color".into(),
-        format!(
-            "{} {} {}",
-            brush.background_r, brush.background_g, brush.background_b
-        ),
+        brush.background_r.to_string(),
+        brush.background_g.to_string(),
+        brush.background_b.to_string(),
         "--background-noise-strength".into(),
         brush.background_noise_strength.to_string(),
         "--growth-grad-threshold".into(),
@@ -244,6 +243,25 @@ mod tests {
             .args
             .windows(2)
             .any(|w| w[0] == "--sh-degree" && w[1] == "2"));
+    }
+
+    #[test]
+    fn background_color_is_three_argv_values() {
+        let spec = train_spec(
+            Path::new("d"),
+            Path::new("o"),
+            PipelineSettings::from_preset(Preset::Fast),
+            20,
+        );
+        let flag = spec
+            .args
+            .iter()
+            .position(|a| a == "--background-color")
+            .expect("background-color flag");
+        assert_eq!(
+            &spec.args[flag..flag + 4],
+            ["--background-color", "0", "0", "0"]
+        );
     }
 
     #[test]

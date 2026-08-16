@@ -53,6 +53,15 @@ describe("matchingPreset", () => {
       }),
     ).toBe("custom");
   });
+
+  it("is custom when SIFT is Metal", () => {
+    expect(
+      matchingPreset({
+        ...PRESET_SETTINGS.balanced,
+        colmap: { ...colmapKnobsFor("object"), siftBackend: "metal" },
+      }),
+    ).toBe("custom");
+  });
 });
 
 describe("defaultsFor", () => {
@@ -67,6 +76,8 @@ describe("defaultsFor", () => {
     expect(room.viewer).toEqual(viewerKnobsFor("room"));
     expect(room.extract).toEqual(object.extract);
     expect(room.brush).toEqual(object.brush);
+    expect(object.colmap.siftBackend).toBe("cpu");
+    expect(room.colmap.siftBackend).toBe("cpu");
   });
 });
 
@@ -86,6 +97,16 @@ describe("applyNamedPreset", () => {
     expect(applied.colmap).toEqual(colmapKnobsFor("outdoor"));
     expect(applied.viewer).toEqual(viewerKnobsFor("outdoor"));
   });
+
+  it("resets Metal SIFT back to CPU", () => {
+    const current = {
+      ...PRESET_SETTINGS.fast,
+      colmap: { ...colmapKnobsFor("object"), siftBackend: "metal" as const },
+    };
+    const applied = applyNamedPreset("quality", current);
+    expect(applied.colmap.siftBackend).toBe("cpu");
+    expect(matchingPreset(applied)).toBe("quality");
+  });
 });
 
 describe("hydrateSettings", () => {
@@ -101,6 +122,16 @@ describe("hydrateSettings", () => {
     const hydrated = hydrateSettings(legacy);
     expect(hydrated.colmap).toEqual(colmapKnobsFor("room"));
     expect(hydrated.viewer).toEqual(viewerKnobsFor("room"));
+  });
+
+  it("fills missing siftBackend on an existing colmap group", () => {
+    const { siftBackend: _dropped, ...legacyColmap } = colmapKnobsFor("object");
+    const hydrated = hydrateSettings({
+      ...PRESET_SETTINGS.fast,
+      colmap: legacyColmap,
+    });
+    expect(hydrated.colmap.siftBackend).toBe("cpu");
+    expect(matchingPreset(hydrated)).toBe("fast");
   });
 });
 
@@ -121,6 +152,16 @@ describe("applyCaptureMode", () => {
     expect(next.captureMode).toBe("outdoor");
     expect(next.brush.shDegree).toBe(1);
     expect(next.maxFrames).toBe(PRESET_SETTINGS.balanced.maxFrames);
+  });
+
+  it("keeps Metal SIFT when already custom", () => {
+    const custom = {
+      ...PRESET_SETTINGS.balanced,
+      colmap: { ...colmapKnobsFor("object"), siftBackend: "metal" as const },
+    };
+    const next = applyCaptureMode(custom, "outdoor");
+    expect(next.captureMode).toBe("outdoor");
+    expect(next.colmap.siftBackend).toBe("metal");
   });
 });
 

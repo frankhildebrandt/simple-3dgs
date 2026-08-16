@@ -1,0 +1,87 @@
+--- a/src/thirdparty/SiftMetal/SiftMetal.mm
++++ b/src/thirdparty/SiftMetal/SiftMetal.mm
+@@ -17,7 +17,10 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
++#include <limits.h>
++#include <mach-o/dyld.h>
+ #include <numeric>
++#include <stdlib.h>
+ #include <string>
+ #include <vector>
+ 
+@@ -217,6 +220,52 @@
+   desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+   desc.storageMode = storage;
+   return [device newTextureWithDescriptor:desc];
++}
++
++// ---------------------------------------------------------------------------
++// Metallib lookup: sidecar layouts, then the CMake bake path.
++// ---------------------------------------------------------------------------
++static NSString* ExecutableDirectory() {
++  uint32_t size = 0;
++  _NSGetExecutablePath(nullptr, &size);
++  std::vector<char> buf(size > 0 ? size : 1);
++  if (_NSGetExecutablePath(buf.data(), &size) != 0) {
++    return nil;
++  }
++  char resolved[PATH_MAX];
++  const char* path = buf.data();
++  if (realpath(path, resolved) != nullptr) {
++    path = resolved;
++  }
++  return [[NSString stringWithUTF8String:path] stringByDeletingLastPathComponent];
++}
++
++static id<MTLLibrary> LoadMetallib(id<MTLDevice> device, NSError** error) {
++  NSMutableArray<NSString*>* candidates = [NSMutableArray array];
++  NSString* exeDir = ExecutableDirectory();
++  if (exeDir.length > 0) {
++    [candidates addObject:[exeDir stringByAppendingPathComponent:@"sift.metallib"]];
++    [candidates
++        addObject:[exeDir stringByAppendingPathComponent:@"colmap-libs/sift.metallib"]];
++    [candidates addObject:[[exeDir
++        stringByAppendingPathComponent:@"../Resources/colmap-libs/sift.metallib"]
++        stringByStandardizingPath]];
++  }
++  const char* baked = SIFT_METAL_METALLIB_PATH;
++  if (baked != nullptr && baked[0] != '\0') {
++    [candidates addObject:[NSString stringWithUTF8String:baked]];
++  }
++  for (NSString* path in candidates) {
++    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
++      continue;
++    }
++    id<MTLLibrary> library =
++        [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
++    if (library) {
++      return library;
++    }
++  }
++  return [device newDefaultLibrary];
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -232,18 +281,9 @@
+   commandQueue_ = [device_ newCommandQueue];
+   if (!commandQueue_) return false;
+ 
+-  // Load the pre-compiled metal library.
++  // Load the pre-compiled metal library from next to the executable first.
+   NSError* error = nil;
+-  NSString* libPath =
+-      [NSString stringWithUTF8String:SIFT_METAL_METALLIB_PATH];
+-  if (libPath.length > 0) {
+-    NSURL* libURL = [NSURL fileURLWithPath:libPath];
+-    library_ = [device_ newLibraryWithURL:libURL error:&error];
+-  }
+-  if (!library_) {
+-    // Fallback: try default library.
+-    library_ = [device_ newDefaultLibrary];
+-  }
++  library_ = LoadMetallib(device_, &error);
+   if (!library_) {
+     NSLog(@"SiftMetal: Failed to load Metal library: %@", error);
+     return false;

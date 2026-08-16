@@ -4,6 +4,8 @@ export type ColmapMatcher = "sequential" | "exhaustive";
 
 export type ColmapMapper = "incremental" | "global";
 
+export type SiftBackend = "cpu" | "metal";
+
 export type ColmapCameraModel =
   | "SIMPLE_RADIAL"
   | "SIMPLE_PINHOLE"
@@ -22,12 +24,17 @@ export type ColmapKnobs = {
   mapper: ColmapMapper;
   minModelSize: number;
   initMinTriAngle: number;
+  siftBackend: SiftBackend;
 };
 
-const SHARED: Pick<ColmapKnobs, "cameraModel" | "singleCamera" | "exhaustiveFrameLimit"> = {
+const SHARED: Pick<
+  ColmapKnobs,
+  "cameraModel" | "singleCamera" | "exhaustiveFrameLimit" | "siftBackend"
+> = {
   cameraModel: "SIMPLE_RADIAL",
   singleCamera: true,
   exhaustiveFrameLimit: 250,
+  siftBackend: "cpu",
 };
 
 /** COLMAP profile that Fast/Balanced/Quality still apply for a capture type. */
