@@ -137,7 +137,7 @@ pub fn viewer_html(entry: &ArchiveEntry, view: Option<&ViewPose>) -> String {
     <h1>{title}</h1>
     <p>{source}</p>
     <p>{created}</p>
-    <p>WASD fly · Q up · E down · Space start · Shift faster</p>
+    <p>Hold left mouse to look · WASD fly · Q up · E down · Y/C roll · Space start · Shift faster</p>
     {geo_block}
   </div>
   <div class="actions">
@@ -211,11 +211,35 @@ pub fn viewer_html(entry: &ArchiveEntry, view: Option<&ViewPose>) -> String {
       KeyQ: new THREE.Vector3(0, 1, 0),
       KeyE: new THREE.Vector3(0, -1, 0),
     }};
+    controls.fpsMovement.keycodeRotateMapping = {{}};
+    controls.fpsMovement.capsMultiplier = 1;
     controls.fpsMovement.moveSpeed = {move_speed};
+    controls.pointerControls.enable = false;
+    const canvas = renderer.domElement;
+    const LOOK_SPEED = 0.002;
+    const ROLL_SPEED = 2;
+    let looking = false;
+    canvas.addEventListener("pointerdown", (event) => {{
+      if (event.button !== 0) return;
+      looking = true;
+      canvas.setPointerCapture(event.pointerId);
+    }});
+    canvas.addEventListener("pointermove", (event) => {{
+      if (!looking) return;
+      camera.rotateY(-event.movementX * LOOK_SPEED);
+      camera.rotateX(-event.movementY * LOOK_SPEED);
+    }});
+    const pointerUp = (event) => {{
+      if (!looking) return;
+      looking = false;
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    }};
+    canvas.addEventListener("pointerup", pointerUp);
+    canvas.addEventListener("pointercancel", pointerUp);
     const homePos = camera.position.clone();
     const homeQuat = camera.quaternion.clone();
     window.addEventListener("keydown", (event) => {{
-      if (["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE"].includes(event.code)) {{
+      if (["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE", "KeyY", "KeyZ", "KeyC"].includes(event.code)) {{
         event.preventDefault();
       }}
       if (event.code !== "Space" || event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -229,7 +253,16 @@ pub fn viewer_html(entry: &ArchiveEntry, view: Option<&ViewPose>) -> String {
       camera.updateProjectionMatrix();
       applyScale();
     }});
+    let lastTime = performance.now();
     renderer.setAnimationLoop(() => {{
+      const now = performance.now();
+      const dt = (now - lastTime) / 1000;
+      lastTime = now;
+      const keys = controls.fpsMovement.keycode;
+      let roll = 0;
+      if (keys.KeyY || keys.KeyZ) roll += 1;
+      if (keys.KeyC) roll -= 1;
+      if (roll) camera.rotateZ(roll * ROLL_SPEED * dt);
       controls.update(camera);
       renderer.render(scene, camera);
     }});
@@ -377,7 +410,14 @@ mod tests {
         assert!(html.contains("keycodeMoveMapping"));
         assert!(html.contains("KeyQ: new THREE.Vector3(0, 1, 0)"));
         assert!(html.contains("KeyE: new THREE.Vector3(0, -1, 0)"));
+        assert!(html.contains("controls.fpsMovement.keycodeRotateMapping = {}"));
+        assert!(html.contains("controls.fpsMovement.capsMultiplier = 1"));
         assert!(html.contains("controls.fpsMovement.moveSpeed = 0.8"));
+        assert!(html.contains("controls.pointerControls.enable = false"));
+        assert!(html.contains("camera.rotateY(-event.movementX * LOOK_SPEED)"));
+        assert!(html.contains("keys.KeyY || keys.KeyZ"));
+        assert!(html.contains("keys.KeyC"));
+        assert!(html.contains("Y/C roll"));
         assert!(html.contains("three/addons/"));
         assert!(html.contains("three@0.180.0/examples/jsm/"));
         assert!(!html.contains("OrbitControls"));

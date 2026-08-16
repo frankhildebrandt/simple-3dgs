@@ -9,6 +9,8 @@ export const MIN_SORT_INTERVAL_MS = 8;
 export const OBJECT_MAX_STD_DEV = Math.sqrt(5);
 export const OUTDOOR_MAX_STD_DEV = Math.sqrt(4);
 export const DEFAULT_FOV = 60;
+export const MOVE_SPEED_MIN = 0.01;
+export const MOVE_SPEED_MAX = 20;
 
 /** Spark / HTML viewer knobs that used to follow capture mode only. */
 export type ViewerKnobs = {

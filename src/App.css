@@ -657,7 +657,25 @@ button.primary {
   right: 0.7rem;
   z-index: 2;
   display: flex;
+  align-items: center;
   gap: 0.4rem;
+}
+
+.viewer-speed {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+
+.viewer-speed input[type="range"] {
+  width: 7rem;
+  accent-color: var(--accent);
 }
 
 .viewer-preview {

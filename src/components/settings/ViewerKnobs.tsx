@@ -1,4 +1,5 @@
 import type { PipelineSettings } from "../../types";
+import { MOVE_SPEED_MAX, MOVE_SPEED_MIN } from "../../viewerKnobs";
 import { Knob } from "./Knob";
 
 type Props = {
@@ -32,7 +33,7 @@ export function ViewerKnobs({ value, disabled, onChange }: Props) {
         <Knob label="Min pixel r" hint="minPixelRadius" min={0} max={8} step={0.1} value={viewer.minPixelRadius} onChange={(minPixelRadius) => patch("minPixelRadius", minPixelRadius)} />
         <Knob label="Sort interval" hint="minSortIntervalMs" min={0} max={64} step={1} value={viewer.minSortIntervalMs} onChange={(minSortIntervalMs) => patch("minSortIntervalMs", minSortIntervalMs)} />
         <Knob label="FOV" hint="Perspective camera field of view" min={10} max={120} step={1} value={viewer.fov} onChange={(fov) => patch("fov", fov)} />
-        <Knob label="Move speed" hint="Fly speed floor in the viewer and HTML export." min={0.05} max={8} step={0.05} value={viewer.moveSpeed} onChange={(moveSpeed) => patch("moveSpeed", moveSpeed)} />
+        <Knob label="Move speed" hint="WASD fly speed in the viewer and HTML export. Shift is 5×, Ctrl is 0.2×." min={MOVE_SPEED_MIN} max={MOVE_SPEED_MAX} step={0.05} value={viewer.moveSpeed} onChange={(moveSpeed) => patch("moveSpeed", moveSpeed)} />
         <Knob label="Far multiplier" hint="camera.far = extent × this" min={1} max={200} step={1} value={viewer.farMultiplier} onChange={(farMultiplier) => patch("farMultiplier", farMultiplier)} />
       </details>
     </fieldset>

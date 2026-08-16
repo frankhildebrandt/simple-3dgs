@@ -1,18 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as THREE from "three";
 import { SparkControls, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
-import { LookCapture, isLookCaptureClick, isLookReleaseKey } from "../lookCapture";
-import { applyPointerLook } from "../pointerLook";
+import { applyPointerLook, applyPointerRoll, isLookDragClick, levelFpsCamera } from "../pointerLook";
 import { jpegBase64FromCanvas, scaledJpegDataUrl } from "../previewCapture";
 import { loadPlyBytes, splatBytesFromInvoke } from "../spzTranscode";
 import { splatFileName, splatKindFromPath, splatLoadHint, splatSidecarPath } from "../splatFile";
 import { readSplatFile } from "../api";
 import { parseMenuMode } from "../appMenu";
 import type { CaptureMode } from "../types";
-import type { ViewerKnobs } from "../viewerKnobs";
-import { viewerKnobsFor } from "../viewerKnobs";
+import { MOVE_SPEED_MAX, MOVE_SPEED_MIN, viewerKnobsFor, type ViewerKnobs } from "../viewerKnobs";
 import {
   applyViewerMode,
   nextViewerMode,
@@ -55,7 +52,6 @@ type World = {
 /** Places the camera at the first capture frame when known, otherwise by capture type. */
 function frameSplat(
   camera: THREE.PerspectiveCamera,
-  controls: SparkControls,
   mesh: SplatMesh,
   mode: CaptureMode,
   profile: ReturnType<typeof viewerProfileFromKnobs>,
@@ -76,12 +72,7 @@ function frameSplat(
     camera.near = Math.max(0.01, extent * 0.0001);
     camera.far = Math.max(1000, extent * profile.farMultiplier);
     camera.updateProjectionMatrix();
-    controls.fpsMovement.moveSpeed =
-      mode === "object"
-        ? Math.max(radius * profile.moveSpeed, profile.moveSpeed)
-        : mode === "outdoor"
-          ? Math.max(extent * 0.15, profile.moveSpeed)
-          : Math.max(extent * 0.08, profile.moveSpeed);
+    levelFpsCamera(camera);
     return;
   }
 
@@ -98,7 +89,7 @@ function frameSplat(
     camera.lookAt(center);
     camera.far = Math.max(1000, dist * 20);
     camera.updateProjectionMatrix();
-    controls.fpsMovement.moveSpeed = Math.max(radius * profile.moveSpeed, profile.moveSpeed);
+    levelFpsCamera(camera);
     return;
   }
 
@@ -113,8 +104,25 @@ function frameSplat(
   camera.near = Math.max(0.01, extent * 0.0001);
   camera.far = Math.max(1000, extent * profile.farMultiplier);
   camera.updateProjectionMatrix();
-  controls.fpsMovement.moveSpeed =
-    mode === "outdoor" ? Math.max(extent * 0.15, profile.moveSpeed) : Math.max(extent * 0.08, profile.moveSpeed);
+  levelFpsCamera(camera);
+}
+
+/** Updates FOV and clip planes from the splat bounds without moving the camera. */
+function applyViewerOptics(
+  camera: THREE.PerspectiveCamera,
+  mesh: SplatMesh,
+  profile: ReturnType<typeof viewerProfileFromKnobs>,
+) {
+  mesh.updateMatrixWorld(true);
+  const box = mesh.getBoundingBox(true);
+  const size = box.isEmpty()
+    ? new THREE.Vector3(1, 1, 1)
+    : box.clone().applyMatrix4(mesh.matrixWorld).getSize(new THREE.Vector3());
+  const extent = Math.max(size.length(), 0.5);
+  camera.fov = profile.fov;
+  camera.near = Math.max(0.01, extent * 0.0001);
+  camera.far = Math.max(1000, extent * profile.farMultiplier);
+  camera.updateProjectionMatrix();
 }
 
 /** Removes a Spark mesh from the scene and frees its GPU buffers. */
@@ -170,6 +178,9 @@ export function SplatViewer({
   const pendingPathRef = useRef<string | null>(null);
   const shownPathRef = useRef<string | null>(null);
   const loadingRef = useRef(false);
+  const [flySpeed, setFlySpeed] = useState(
+    () => (viewer ?? viewerKnobsFor(captureMode)).moveSpeed,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -277,32 +288,40 @@ export function SplatViewer({
       KeyQ: new THREE.Vector3(0, 1, 0),
       KeyE: new THREE.Vector3(0, -1, 0),
     };
-    controls.fpsMovement.moveSpeed = 2;
+    controls.fpsMovement.keycodeRotateMapping = {};
+    controls.fpsMovement.capsMultiplier = 1;
+    controls.fpsMovement.moveSpeed = knobsRef.current.moveSpeed;
     controls.pointerControls.enable = false;
 
     worldRef.current = { scene, camera, renderer, spark, controls, splat: null, framed: false, view: null };
     setReady(true);
 
-    const look = new LookCapture(getCurrentWindow());
+    let looking = false;
+    const canvas = renderer.domElement;
     const onPointerDown = (event: PointerEvent) => {
-      renderer.domElement.focus();
-      if (!isLookCaptureClick(event)) {
+      canvas.focus();
+      if (!isLookDragClick(event)) {
         return;
       }
-      void look.enter();
+      looking = true;
+      canvas.setPointerCapture(event.pointerId);
     };
-    const onMouseMove = (event: MouseEvent) => {
-      if (!look.captured) {
+    const onPointerMove = (event: PointerEvent) => {
+      if (!looking) {
         return;
       }
       applyPointerLook(camera, event.movementX, event.movementY);
     };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (isLookReleaseKey(event) && look.captured) {
-        event.preventDefault();
-        void look.exit();
+    const onPointerUp = (event: PointerEvent) => {
+      if (!looking) {
         return;
       }
+      looking = false;
+      if (canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
       if (event.code !== "Space" || event.repeat || event.metaKey || event.ctrlKey || event.altKey) {
         return;
       }
@@ -319,19 +338,30 @@ export function SplatViewer({
         return;
       }
       event.preventDefault();
-      frameSplat(world.camera, world.controls, mesh, modeRef.current, viewerProfileFromKnobs(knobsRef.current, liveRef.current), world.view);
+      frameSplat(world.camera, mesh, modeRef.current, viewerProfileFromKnobs(knobsRef.current, liveRef.current), world.view);
     };
-    const onBlur = () => {
-      void look.exit();
-    };
-    host.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointercancel", onPointerUp);
     host.addEventListener("keydown", onKeyDown);
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("blur", onBlur);
 
     let frame = 0;
+    let lastTime = performance.now();
     const animate = () => {
       frame = requestAnimationFrame(animate);
+      const now = performance.now();
+      const dt = (now - lastTime) / 1000;
+      lastTime = now;
+      const keys = controls.fpsMovement.keycode;
+      let roll = 0;
+      if (keys.KeyY || keys.KeyZ) {
+        roll += 1;
+      }
+      if (keys.KeyC) {
+        roll -= 1;
+      }
+      applyPointerRoll(camera, roll, dt);
       controls.update(camera);
       renderer.render(scene, camera);
     };
@@ -351,11 +381,11 @@ export function SplatViewer({
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
-      host.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointercancel", onPointerUp);
       host.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("blur", onBlur);
-      void look.exit();
       controls.fpsMovement.enable = false;
       controls.pointerControls.enable = false;
       const splat = worldRef.current?.splat;
@@ -452,7 +482,7 @@ export function SplatViewer({
           return;
         }
         world.view = view;
-        frameSplat(world.camera, world.controls, mesh, modeRef.current, profile, view);
+        frameSplat(world.camera, mesh, modeRef.current, profile, view);
         world.framed = true;
         setFramed(true);
         setLoadError(null);
@@ -486,13 +516,36 @@ export function SplatViewer({
     const profile = viewerProfileFromKnobs(viewer ?? viewerKnobsFor(captureMode), live);
     Object.assign(world.spark, sparkTuning(profile));
     applyViewerMode(world.spark, viewModeRef.current, profile);
+    applyViewerOptics(world.camera, mesh, profile);
+  }, [viewer, captureMode, ready, live]);
+
+  useEffect(() => {
+    const world = worldRef.current;
+    const mesh = world?.splat;
+    if (!ready || !world || !mesh || !world.framed) {
+      return;
+    }
+    const profile = viewerProfileFromKnobs(knobsRef.current, liveRef.current);
     void mesh.initialized.then((readyMesh) => {
       if (worldRef.current?.splat !== readyMesh) {
         return;
       }
-      frameSplat(world.camera, world.controls, readyMesh, captureMode, profile, world.view);
+      frameSplat(world.camera, readyMesh, captureMode, profile, world.view);
     });
-  }, [captureMode, viewer, ready, live]);
+  }, [captureMode, ready]);
+
+  const knobSpeed = (viewer ?? viewerKnobsFor(captureMode)).moveSpeed;
+  useEffect(() => {
+    setFlySpeed(knobSpeed);
+  }, [knobSpeed]);
+
+  useEffect(() => {
+    const world = worldRef.current;
+    if (!ready || !world) {
+      return;
+    }
+    world.controls.fpsMovement.moveSpeed = flySpeed;
+  }, [ready, flySpeed]);
 
   useEffect(() => {
     const world = worldRef.current;
@@ -518,8 +571,8 @@ export function SplatViewer({
   const hint = loadError
     ? loadError
     : live
-      ? "Live preview — Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster"
-      : "Click to look · Esc release · WASD fly · Q up · E down · Space start · Shift faster";
+      ? "Live preview — Hold left mouse to look · WASD fly · Q up · E down · Y/C roll · Space start · Shift faster"
+      : "Hold left mouse to look · WASD fly · Q up · E down · Y/C roll · Space start · Shift faster";
 
   return (
     <div className="viewer" ref={hostRef}>
@@ -534,6 +587,18 @@ export function SplatViewer({
         </button>
       ) : null}
       <div className="viewer-actions">
+        <label className="viewer-speed">
+          Speed
+          <input
+            type="range"
+            min={MOVE_SPEED_MIN}
+            max={MOVE_SPEED_MAX}
+            step={0.05}
+            value={flySpeed}
+            aria-label="Move speed"
+            onChange={(event) => setFlySpeed(Number(event.currentTarget.value))}
+          />
+        </label>
         <button
           type="button"
           className="viewer-mode"
