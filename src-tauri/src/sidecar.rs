@@ -408,9 +408,11 @@ impl SidecarRunner for FakeRunner {
             }
         }
         if spec.watch_mode == WatchMode::Image {
-            if let Some(path) = spec.watch_dir.as_ref().and_then(|dir| {
-                crate::project::newest_image(dir)
-            }) {
+            if let Some(path) = spec
+                .watch_dir
+                .as_ref()
+                .and_then(|dir| crate::project::newest_image(dir))
+            {
                 preview(&path);
             }
         }

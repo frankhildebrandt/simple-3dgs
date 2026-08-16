@@ -1,5 +1,5 @@
 import type { CaptureMode, PipelineSettings } from "../types";
-import { maxFramesCap } from "../types";
+import { applyCaptureMode } from "../types";
 
 type Props = {
   value: PipelineSettings;
@@ -31,10 +31,11 @@ const OPTIONS = [
 
 export function CaptureModePicker({ value, disabled, onChange, onHelp }: Props) {
   const selected: CaptureMode = value.captureMode;
+  const current = OPTIONS.find((option) => option.id === selected) ?? OPTIONS[0];
 
   return (
-    <fieldset className="presets capture-modes">
-      <legend>
+    <div className="inspector-row">
+      <span className="inspector-key">
         Capture
         <button
           type="button"
@@ -45,34 +46,22 @@ export function CaptureModePicker({ value, disabled, onChange, onHelp }: Props) 
         >
           ?
         </button>
-      </legend>
-      {OPTIONS.map((option) => (
-        <label
-          key={option.id}
-          className={option.id === selected ? "selected" : ""}
-          title={option.hint}
-          data-hint={option.hint}
-        >
-          <input
-            type="radio"
-            name="capture-mode"
-            value={option.id}
-            checked={option.id === selected}
-            disabled={disabled}
-            onChange={() =>
-              onChange({
-                ...value,
-                captureMode: option.id,
-                maxFrames: Math.min(value.maxFrames, maxFramesCap(option.id)),
-              })
-            }
-          />
-          <span>
-            <strong>{option.title}</strong>
-            <small>{option.detail}</small>
-          </span>
-        </label>
-      ))}
-    </fieldset>
+      </span>
+      <select
+        value={selected}
+        disabled={disabled}
+        title={current.hint}
+        aria-label="Capture"
+        onChange={(event) =>
+          onChange(applyCaptureMode(value, event.currentTarget.value as CaptureMode))
+        }
+      >
+        {OPTIONS.map((option) => (
+          <option key={option.id} value={option.id} title={option.hint}>
+            {option.title} — {option.detail}
+          </option>
+        ))}
+      </select>
+    </div>
   );
 }

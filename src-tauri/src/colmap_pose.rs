@@ -200,7 +200,10 @@ fn parse_points3d(path: &Path) -> io::Result<(Vec<[f32; 3]>, Vec<[u8; 3]>)> {
     let mut cur = Cursor::new(bytes.as_slice());
     let n = read_u64(&mut cur)?;
     if n > 10_000_000 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "too many points"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "too many points",
+        ));
     }
     let stride = if n as usize > MAX_SPARSE_POINTS {
         (n as usize / MAX_SPARSE_POINTS).max(1)
@@ -527,7 +530,8 @@ mod tests {
         assert_eq!(preview.cameras[0].name, "frame_00001.jpg");
         assert_eq!(preview.points.len(), 1);
         assert_eq!(preview.colors[0], [10, 20, 30]);
-        let manifest = camera_manifest(model, &["frame_00001.jpg".into(), "frame_00002.jpg".into()]);
+        let manifest =
+            camera_manifest(model, &["frame_00001.jpg".into(), "frame_00002.jpg".into()]);
         assert_eq!(manifest.cameras.len(), 2);
         assert!(manifest.cameras[0].registered);
         assert!(!manifest.cameras[1].registered);

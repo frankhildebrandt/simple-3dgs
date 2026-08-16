@@ -1,5 +1,5 @@
 //! Brush CLI training command. Flags match ArthurBrussee/brush on `main`.
-//! Splat cap comes from settings; refine cadence follows frame count.
+//! Splat cap comes from settings; refine cadence follows frame count unless set.
 
 use std::path::Path;
 
@@ -26,29 +26,93 @@ pub fn train_spec(
     frame_count: usize,
 ) -> CommandSpec {
     let settings = settings.sanitized();
+    let brush = settings.brush_knobs();
     let steps = settings.train_steps;
-    let every = preview_export_every(steps);
-    CommandSpec::new(
-        "brush",
-        vec![
-            path_arg(dataset_dir),
-            "--total-train-iters".into(),
-            steps.to_string(),
-            "--max-resolution".into(),
-            settings.train_resolution().to_string(),
-            "--max-splats".into(),
-            settings.max_splats.to_string(),
-            "--refine-every".into(),
-            refine_every(frame_count).to_string(),
-            "--export-path".into(),
-            path_arg(export_dir),
-            "--export-name".into(),
-            EXPORT_NAME.into(),
-            "--export-every".into(),
-            every.to_string(),
-        ],
-    )
-    .watching(export_dir)
+    let export_every = if brush.export_every == 0 {
+        preview_export_every(steps)
+    } else {
+        brush.export_every
+    };
+    let refine = if brush.refine_every == 0 {
+        refine_every(frame_count)
+    } else {
+        brush.refine_every
+    };
+    let mut args = vec![
+        path_arg(dataset_dir),
+        "--total-train-iters".into(),
+        steps.to_string(),
+        "--max-splats".into(),
+        settings.max_splats.to_string(),
+        "--refine-every".into(),
+        refine.to_string(),
+        "--export-path".into(),
+        path_arg(export_dir),
+        "--export-name".into(),
+        EXPORT_NAME.into(),
+        "--export-every".into(),
+        export_every.to_string(),
+        "--lr-mean".into(),
+        brush.lr_mean.to_string(),
+        "--lr-mean-end".into(),
+        brush.lr_mean_end.to_string(),
+        "--mean-noise-weight".into(),
+        brush.mean_noise_weight.to_string(),
+        "--lr-coeffs-dc".into(),
+        brush.lr_coeffs_dc.to_string(),
+        "--lr-coeffs-sh-scale".into(),
+        brush.lr_coeffs_sh_scale.to_string(),
+        "--lr-opac".into(),
+        brush.lr_opac.to_string(),
+        "--lr-scale".into(),
+        brush.lr_scale.to_string(),
+        "--lr-rotation".into(),
+        brush.lr_rotation.to_string(),
+        "--ssim-weight".into(),
+        brush.ssim_weight.to_string(),
+        "--opac-decay".into(),
+        brush.opac_decay.to_string(),
+        "--lpips-loss-weight".into(),
+        brush.lpips_loss_weight.to_string(),
+        "--match-alpha-weight".into(),
+        brush.match_alpha_weight.to_string(),
+        "--background-color".into(),
+        format!(
+            "{} {} {}",
+            brush.background_r, brush.background_g, brush.background_b
+        ),
+        "--background-noise-strength".into(),
+        brush.background_noise_strength.to_string(),
+        "--growth-grad-threshold".into(),
+        brush.growth_grad_threshold.to_string(),
+        "--growth-select-fraction".into(),
+        brush.growth_select_fraction.to_string(),
+        "--growth-stop-iter".into(),
+        brush.growth_stop_iter.to_string(),
+        "--split-at-screen-size".into(),
+        brush.split_at_screen_size.to_string(),
+        "--sh-degree".into(),
+        brush.sh_degree.to_string(),
+        "--seed".into(),
+        brush.seed.to_string(),
+        "--eval-every".into(),
+        brush.eval_every.to_string(),
+        "--max-scene-batch-cache-size".into(),
+        format!("{}GiB", brush.max_scene_batch_cache_gib),
+        "--lod-levels".into(),
+        brush.lod_levels.to_string(),
+        "--lod-refine-steps".into(),
+        brush.lod_refine_steps.to_string(),
+        "--lod-decimation-keep".into(),
+        brush.lod_decimation_keep.to_string(),
+        "--lod-image-scale".into(),
+        brush.lod_image_scale.to_string(),
+    ];
+    if let Some(res) = settings.train_resolution() {
+        args.push("--max-resolution".into());
+        args.push(res.to_string());
+    }
+    CommandSpec::new("brush", args).watching(export_dir)
 }
 
 #[cfg(test)]
@@ -149,5 +213,47 @@ mod tests {
             .args
             .windows(2)
             .any(|w| w[0] == "--refine-every" && w[1] == "50"));
+    }
+
+    #[test]
+    fn zero_refine_every_keeps_heuristic() {
+        let mut settings = PipelineSettings::from_preset(Preset::Fast);
+        let mut brush = settings.brush_knobs();
+        brush.refine_every = 0;
+        settings.brush = Some(brush);
+        let spec = train_spec(Path::new("d"), Path::new("o"), settings, 80);
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--refine-every" && w[1] == "80"));
+    }
+
+    #[test]
+    fn explicit_refine_every_is_passed() {
+        let mut settings = PipelineSettings::from_preset(Preset::Fast);
+        let mut brush = settings.brush_knobs();
+        brush.refine_every = 33;
+        brush.sh_degree = 2;
+        settings.brush = Some(brush);
+        let spec = train_spec(Path::new("d"), Path::new("o"), settings, 80);
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--refine-every" && w[1] == "33"));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--sh-degree" && w[1] == "2"));
+    }
+
+    #[test]
+    fn native_train_omits_max_resolution_when_uncapped() {
+        let mut settings = PipelineSettings::from_preset(Preset::Fast);
+        settings.max_image_size = 0;
+        let mut brush = settings.brush_knobs();
+        brush.train_max_resolution = 0;
+        settings.brush = Some(brush);
+        let spec = train_spec(Path::new("d"), Path::new("o"), settings, 20);
+        assert!(!spec.args.iter().any(|a| a == "--max-resolution"));
     }
 }

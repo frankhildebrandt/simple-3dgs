@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as THREE from "three";
 import { SparkControls, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
@@ -8,14 +9,17 @@ import { jpegBase64FromCanvas, scaledJpegDataUrl } from "../previewCapture";
 import { loadPlyBytes, splatBytesFromInvoke } from "../spzTranscode";
 import { splatFileName, splatKindFromPath, splatLoadHint, splatSidecarPath } from "../splatFile";
 import { readSplatFile } from "../api";
+import { parseMenuMode } from "../appMenu";
 import type { CaptureMode } from "../types";
+import type { ViewerKnobs } from "../viewerKnobs";
+import { viewerKnobsFor } from "../viewerKnobs";
 import {
   applyViewerMode,
   nextViewerMode,
   viewerModeLabel,
   type ViewerMode,
 } from "../viewerMode";
-import { sparkTuning, splatLoadFlags, viewerProfile } from "../viewerProfile";
+import { sparkTuning, splatLoadFlags, viewerProfileFromKnobs } from "../viewerProfile";
 import {
   viewerPixelRatio,
   viewerScaleForSession,
@@ -25,6 +29,7 @@ import {
 type Props = {
   plyPath: string | null;
   captureMode?: CaptureMode;
+  viewer?: ViewerKnobs;
   live?: boolean;
   fullscreen?: boolean;
   onToggleFullscreen?: () => void;
@@ -53,6 +58,7 @@ function frameSplat(
   controls: SparkControls,
   mesh: SplatMesh,
   mode: CaptureMode,
+  profile: ReturnType<typeof viewerProfileFromKnobs>,
   view: ViewPose | null,
 ) {
   mesh.updateMatrixWorld(true);
@@ -62,19 +68,20 @@ function frameSplat(
     : box.clone().applyMatrix4(mesh.matrixWorld).getSize(new THREE.Vector3());
   const extent = Math.max(size.length(), 0.5);
   const radius = Math.max(size.x, size.y, size.z, 0.5) * 0.5;
+  camera.fov = profile.fov;
 
   if (view) {
     camera.position.set(view.position[0], view.position[1], view.position[2]);
     camera.quaternion.set(view.quaternion[0], view.quaternion[1], view.quaternion[2], view.quaternion[3]);
     camera.near = Math.max(0.01, extent * 0.0001);
-    camera.far = Math.max(1000, extent * (mode === "outdoor" ? 80 : 40));
+    camera.far = Math.max(1000, extent * profile.farMultiplier);
     camera.updateProjectionMatrix();
     controls.fpsMovement.moveSpeed =
       mode === "object"
-        ? Math.max(radius * 0.8, 0.8)
+        ? Math.max(radius * profile.moveSpeed, profile.moveSpeed)
         : mode === "outdoor"
-          ? Math.max(extent * 0.15, 2)
-          : Math.max(extent * 0.08, 0.5);
+          ? Math.max(extent * 0.15, profile.moveSpeed)
+          : Math.max(extent * 0.08, profile.moveSpeed);
     return;
   }
 
@@ -91,7 +98,7 @@ function frameSplat(
     camera.lookAt(center);
     camera.far = Math.max(1000, dist * 20);
     camera.updateProjectionMatrix();
-    controls.fpsMovement.moveSpeed = Math.max(radius * 0.8, 0.8);
+    controls.fpsMovement.moveSpeed = Math.max(radius * profile.moveSpeed, profile.moveSpeed);
     return;
   }
 
@@ -104,10 +111,10 @@ function frameSplat(
   }
   camera.lookAt(target);
   camera.near = Math.max(0.01, extent * 0.0001);
-  camera.far = Math.max(1000, extent * (mode === "outdoor" ? 80 : 40));
+  camera.far = Math.max(1000, extent * profile.farMultiplier);
   camera.updateProjectionMatrix();
-    controls.fpsMovement.moveSpeed =
-    mode === "outdoor" ? Math.max(extent * 0.15, 2) : Math.max(extent * 0.08, 0.5);
+  controls.fpsMovement.moveSpeed =
+    mode === "outdoor" ? Math.max(extent * 0.15, profile.moveSpeed) : Math.max(extent * 0.08, profile.moveSpeed);
 }
 
 /** Removes a Spark mesh from the scene and frees its GPU buffers. */
@@ -136,6 +143,7 @@ async function loadViewPose(plyPath: string): Promise<ViewPose | null> {
 export function SplatViewer({
   plyPath,
   captureMode = "object",
+  viewer,
   live,
   fullscreen,
   onToggleFullscreen,
@@ -145,6 +153,8 @@ export function SplatViewer({
   const worldRef = useRef<World | null>(null);
   const modeRef = useRef(captureMode);
   modeRef.current = captureMode;
+  const knobsRef = useRef(viewer ?? viewerKnobsFor(captureMode));
+  knobsRef.current = viewer ?? viewerKnobsFor(captureMode);
   const [ready, setReady] = useState(false);
   const [framed, setFramed] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -161,13 +171,34 @@ export function SplatViewer({
   const shownPathRef = useRef<string | null>(null);
   const loadingRef = useRef(false);
 
+  useEffect(() => {
+    let cancelled = false;
+    let stop: (() => void) | undefined;
+    void listen<string>("menu-mode", (event) => {
+      const next = parseMenuMode(event.payload);
+      if (next) {
+        setViewMode(next);
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      stop = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, []);
+
   /** Renders the current view to JPEG base64, or null if the splat is not framed. */
   function capturePreview(): string | null {
     const world = worldRef.current;
     if (!world?.splat || !world.framed) {
       return null;
     }
-    const profile = viewerProfile(modeRef.current, liveRef.current);
+    const profile = viewerProfileFromKnobs(knobsRef.current, liveRef.current);
     applyViewerMode(world.spark, "splats", profile);
     try {
       world.renderer.render(world.scene, world.camera);
@@ -205,7 +236,7 @@ export function SplatViewer({
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x101114);
     const camera = new THREE.PerspectiveCamera(
-      60,
+      knobsRef.current.fov,
       host.clientWidth / Math.max(host.clientHeight, 1),
       0.01,
       1000,
@@ -227,11 +258,12 @@ export function SplatViewer({
     host.tabIndex = 0;
     host.appendChild(renderer.domElement);
 
-    const profile = viewerProfile(modeRef.current, liveRef.current);
+    const profile = viewerProfileFromKnobs(knobsRef.current, liveRef.current);
     const spark = new SparkRenderer({
       renderer,
       ...sparkTuning(profile),
       enableLod: true,
+      lodSplatCount: knobsRef.current.webviewLodSplatCount,
     });
     applyViewerMode(spark, viewModeRef.current, profile);
     scene.add(spark);
@@ -287,7 +319,7 @@ export function SplatViewer({
         return;
       }
       event.preventDefault();
-      frameSplat(world.camera, world.controls, mesh, modeRef.current, world.view);
+      frameSplat(world.camera, world.controls, mesh, modeRef.current, viewerProfileFromKnobs(knobsRef.current, liveRef.current), world.view);
     };
     const onBlur = () => {
       void look.exit();
@@ -394,7 +426,7 @@ export function SplatViewer({
         if (worldRef.current !== world || pendingPathRef.current !== path) {
           return;
         }
-        const profile = viewerProfile(modeRef.current, liveRef.current);
+        const profile = viewerProfileFromKnobs(knobsRef.current, liveRef.current);
         const kind = splatKindFromPath(path);
         next = new SplatMesh({
           fileBytes: bytes,
@@ -420,7 +452,7 @@ export function SplatViewer({
           return;
         }
         world.view = view;
-        frameSplat(world.camera, world.controls, mesh, modeRef.current, view);
+        frameSplat(world.camera, world.controls, mesh, modeRef.current, profile, view);
         world.framed = true;
         setFramed(true);
         setLoadError(null);
@@ -451,16 +483,16 @@ export function SplatViewer({
     if (!ready || !world || !mesh || !world.framed) {
       return;
     }
-    const profile = viewerProfile(captureMode, live);
+    const profile = viewerProfileFromKnobs(viewer ?? viewerKnobsFor(captureMode), live);
     Object.assign(world.spark, sparkTuning(profile));
     applyViewerMode(world.spark, viewModeRef.current, profile);
     void mesh.initialized.then((readyMesh) => {
       if (worldRef.current?.splat !== readyMesh) {
         return;
       }
-      frameSplat(world.camera, world.controls, readyMesh, captureMode, world.view);
+      frameSplat(world.camera, world.controls, readyMesh, captureMode, profile, world.view);
     });
-  }, [captureMode, ready, live]);
+  }, [captureMode, viewer, ready, live]);
 
   useEffect(() => {
     const world = worldRef.current;
@@ -480,7 +512,7 @@ export function SplatViewer({
     if (!ready || !world) {
       return;
     }
-    applyViewerMode(world.spark, viewMode, viewerProfile(modeRef.current, liveRef.current));
+    applyViewerMode(world.spark, viewMode, viewerProfileFromKnobs(knobsRef.current, liveRef.current));
   }, [ready, viewMode]);
 
   const hint = loadError

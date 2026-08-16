@@ -1,42 +1,30 @@
-import { open } from "@tauri-apps/plugin-dialog";
 import type { ProjectEntry } from "../types";
 
 type Props = {
   project: ProjectEntry | null;
   projects: ProjectEntry[];
   disabled: boolean;
-  onNew: () => void;
   onOpen: (path: string) => void;
 };
 
-/** Named project identity: create, open, or pick from the projects folder. */
-export function ProjectPicker({ project, projects, disabled, onNew, onOpen }: Props) {
-  async function pickFolder() {
-    const selected = await open({ directory: true, multiple: false });
-    if (typeof selected === "string") {
-      onOpen(selected);
-    }
-  }
-
+/** Named project identity and recent-project picker. New/Open live in the File menu. */
+export function ProjectPicker({ project, projects, disabled, onOpen }: Props) {
   return (
-    <section className="project-picker">
-      <p className="dropzone-label">
-        {project ? `Project: ${project.title}` : "No project yet"}
-      </p>
-      <div className="row">
-        <button type="button" disabled={disabled} onClick={onNew}>
-          New project
-        </button>
-        <button type="button" disabled={disabled} onClick={() => void pickFolder()}>
-          Open…
-        </button>
+    <fieldset className="project-picker">
+      <legend>Project</legend>
+      <div className="inspector-row">
+        <span className="inspector-key">Name</span>
+        <span className="inspector-value" title={project ? project.title : undefined}>
+          {project ? project.title : "None"}
+        </span>
       </div>
       {projects.length > 0 ? (
-        <label className="project-select">
-          Recent
+        <label className="inspector-row">
+          <span className="inspector-key">Recent</span>
           <select
             disabled={disabled}
             value={project?.dir ?? ""}
+            aria-label="Recent projects"
             onChange={(event) => {
               if (event.currentTarget.value) {
                 onOpen(event.currentTarget.value);
@@ -52,6 +40,6 @@ export function ProjectPicker({ project, projects, disabled, onNew, onOpen }: Pr
           </select>
         </label>
       ) : null}
-    </section>
+    </fieldset>
   );
 }

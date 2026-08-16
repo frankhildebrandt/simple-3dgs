@@ -2,27 +2,26 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::brush_knobs::BrushKnobs;
+use crate::colmap_knobs::ColmapKnobs;
+use crate::extract_knobs::ExtractKnobs;
 use crate::preset::Preset;
+use crate::viewer_knobs::ViewerKnobs;
 
-/// What the capture covers. Drives COLMAP matching, mapper flags, and capture hints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CaptureMode {
-    #[default]
-    Object,
-    Room,
-    Outdoor,
-}
+pub use crate::capture_mode::CaptureMode;
 
-impl CaptureMode {
-    /// Hard video keyframe cap. Outdoor paths can run much longer than orbits or rooms.
-    pub fn max_frames_cap(self) -> u32 {
-        match self {
-            Self::Object | Self::Room => 800,
-            Self::Outdoor => 10_000,
-        }
-    }
-}
+pub const FPS_MIN: f32 = 0.05;
+pub const FPS_MAX: f32 = 60.0;
+pub const MAX_IMAGE_SIZE_MIN: u32 = 64;
+pub const MAX_IMAGE_SIZE_MAX: u32 = 16_384;
+pub const TRAIN_STEPS_MIN: u32 = 1;
+pub const TRAIN_STEPS_MAX: u32 = 1_000_000;
+pub const MATCH_OVERLAP_MIN: u32 = 1;
+pub const MATCH_OVERLAP_MAX: u32 = 200;
+pub const MAX_SPLATS_MIN: u32 = 1_000;
+pub const MAX_SPLATS_MAX: u32 = 100_000_000;
+pub const MAX_FRAMES_MIN: u32 = 1;
+pub const MAX_FRAMES_MAX: u32 = 50_000;
 
 /// Still format written by FFmpeg. PNG is lossless; JPEG uses [`PipelineSettings::jpeg_quality`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -79,6 +78,15 @@ pub struct PipelineSettings {
     /// Change-mode overlap quality. 100 extracts sooner when the picture moves.
     #[serde(default = "default_extract_quality")]
     pub extract_quality: u8,
+    /// Missing in old archive JSON; hydrated from capture mode in [`Self::sanitized`].
+    #[serde(default)]
+    pub extract: Option<ExtractKnobs>,
+    #[serde(default)]
+    pub colmap: Option<ColmapKnobs>,
+    #[serde(default)]
+    pub brush: Option<BrushKnobs>,
+    #[serde(default)]
+    pub viewer: Option<ViewerKnobs>,
 }
 
 fn default_jpeg_quality() -> u8 {
@@ -100,84 +108,104 @@ fn default_extract_quality() -> u8 {
 impl PipelineSettings {
     pub fn from_preset(preset: Preset) -> Self {
         match preset {
-            Preset::Fast => Self {
-                fps: 1.0,
-                max_image_size: 800,
-                start_seconds: 0.0,
-                duration_seconds: 0.0,
-                frame_format: FrameFormat::Jpg,
-                jpeg_quality: 80,
-                train_steps: 5_000,
-                match_overlap: 15,
-                capture_mode: CaptureMode::Object,
-                max_splats: 2_000_000,
-                max_frames: 120,
-                extract_mode: ExtractMode::Density,
-                extract_quality: default_extract_quality(),
-            },
-            Preset::Balanced => Self {
-                fps: 2.0,
-                max_image_size: 1600,
-                start_seconds: 0.0,
-                duration_seconds: 0.0,
-                frame_format: FrameFormat::Jpg,
-                jpeg_quality: 95,
-                train_steps: 15_000,
-                match_overlap: 15,
-                capture_mode: CaptureMode::Object,
-                max_splats: 5_000_000,
-                max_frames: 250,
-                extract_mode: ExtractMode::Density,
-                extract_quality: default_extract_quality(),
-            },
-            Preset::Quality => Self {
-                fps: 4.0,
-                max_image_size: 1920,
-                start_seconds: 0.0,
-                duration_seconds: 0.0,
-                frame_format: FrameFormat::Jpg,
-                jpeg_quality: 100,
-                train_steps: 30_000,
-                match_overlap: 15,
-                capture_mode: CaptureMode::Object,
-                max_splats: 10_000_000,
-                max_frames: 500,
-                extract_mode: ExtractMode::Density,
-                extract_quality: default_extract_quality(),
-            },
+            Preset::Fast => Self::named_recipe(1.0, 800, 80, 5_000, 2_000_000, 120),
+            Preset::Balanced => Self::named_recipe(2.0, 1600, 95, 15_000, 5_000_000, 250),
+            Preset::Quality => Self::named_recipe(4.0, 1920, 100, 30_000, 10_000_000, 500),
         }
     }
 
-    /// Clamps values to ranges the sidecars can survive.
+    /// Named recipes leave nested groups unset so capture mode still hydrates them.
+    fn named_recipe(
+        fps: f32,
+        max_image_size: u32,
+        jpeg_quality: u8,
+        train_steps: u32,
+        max_splats: u32,
+        max_frames: u32,
+    ) -> Self {
+        Self {
+            fps,
+            max_image_size,
+            start_seconds: 0.0,
+            duration_seconds: 0.0,
+            frame_format: FrameFormat::Jpg,
+            jpeg_quality,
+            train_steps,
+            match_overlap: 15,
+            capture_mode: CaptureMode::Object,
+            max_splats,
+            max_frames,
+            extract_mode: ExtractMode::Density,
+            extract_quality: default_extract_quality(),
+            extract: None,
+            colmap: None,
+            brush: None,
+            viewer: None,
+        }
+    }
+
+    /// Clamps values to ranges the sidecars can survive. No capture-mode policy floors.
     pub fn sanitized(self) -> Self {
         Self {
-            fps: self.fps.clamp(0.25, 12.0),
+            fps: self.fps.clamp(FPS_MIN, FPS_MAX),
             max_image_size: match self.max_image_size {
                 0 => 0,
-                n => n.clamp(320, 8192),
+                n => n.clamp(MAX_IMAGE_SIZE_MIN, MAX_IMAGE_SIZE_MAX),
             },
             start_seconds: self.start_seconds.max(0.0),
             duration_seconds: self.duration_seconds.max(0.0),
             frame_format: self.frame_format,
             jpeg_quality: self.jpeg_quality.clamp(1, 100),
-            train_steps: self.train_steps.clamp(100, 100_000),
-            match_overlap: self.match_overlap.clamp(2, 50),
+            train_steps: self.train_steps.clamp(TRAIN_STEPS_MIN, TRAIN_STEPS_MAX),
+            match_overlap: self.match_overlap.clamp(MATCH_OVERLAP_MIN, MATCH_OVERLAP_MAX),
             capture_mode: self.capture_mode,
-            max_splats: self.max_splats.clamp(100_000, 20_000_000),
-            max_frames: self.max_frames.clamp(8, self.capture_mode.max_frames_cap()),
+            max_splats: self.max_splats.clamp(MAX_SPLATS_MIN, MAX_SPLATS_MAX),
+            max_frames: self.max_frames.clamp(MAX_FRAMES_MIN, MAX_FRAMES_MAX),
             extract_mode: self.extract_mode,
             extract_quality: self.extract_quality.clamp(1, 100),
+            extract: Some(self.extract_knobs()),
+            colmap: Some(self.colmap_knobs()),
+            brush: Some(self.brush_knobs()),
+            viewer: Some(self.viewer_knobs()),
         }
+    }
+
+    /// Keyframe scoring knobs; defaults when the nested group is missing.
+    pub fn extract_knobs(self) -> ExtractKnobs {
+        self.extract.unwrap_or_default().sanitized()
+    }
+
+    /// SfM knobs; capture-mode profile when the nested group is missing.
+    pub fn colmap_knobs(self) -> ColmapKnobs {
+        self.colmap
+            .unwrap_or_else(|| ColmapKnobs::for_capture(self.capture_mode))
+            .sanitized()
+    }
+
+    /// Brush knobs; CLI defaults when the nested group is missing.
+    pub fn brush_knobs(self) -> BrushKnobs {
+        self.brush.unwrap_or_default().sanitized()
+    }
+
+    /// Spark knobs; capture-mode profile when the nested group is missing.
+    pub fn viewer_knobs(self) -> ViewerKnobs {
+        self.viewer
+            .unwrap_or_else(|| ViewerKnobs::for_capture(self.capture_mode))
+            .sanitized()
     }
 
     /// Longest edge for FFmpeg scale / COLMAP SIFT / Brush. `None` keeps the source size.
     pub fn longest_edge(self) -> Option<u32> {
-        (self.max_image_size >= 320).then_some(self.max_image_size)
+        (self.max_image_size > 0).then_some(self.max_image_size)
     }
 
-    /// Brush `--max-resolution`. Native extract still needs a cap.
-    pub fn train_resolution(self) -> u32 {
-        self.longest_edge().unwrap_or(1920)
+    /// Brush `--max-resolution`. `None` means native (omit the flag).
+    pub fn train_resolution(self) -> Option<u32> {
+        let cap = self.brush_knobs().train_max_resolution;
+        match self.longest_edge() {
+            Some(edge) => Some(if cap == 0 { edge } else { edge.min(cap) }),
+            None => (cap > 0).then_some(cap),
+        }
     }
 }
 
@@ -214,13 +242,13 @@ mod tests {
             ..PipelineSettings::from_preset(Preset::Fast)
         };
         let clean = raw.sanitized();
-        assert_eq!(clean.fps, 12.0);
-        assert_eq!(clean.max_image_size, 320);
+        assert_eq!(clean.fps, FPS_MAX);
+        assert_eq!(clean.max_image_size, MAX_IMAGE_SIZE_MIN);
         assert_eq!(clean.start_seconds, 0.0);
         assert_eq!(clean.duration_seconds, 0.0);
         assert_eq!(clean.jpeg_quality, 1);
-        assert_eq!(clean.train_steps, 100);
-        assert_eq!(clean.match_overlap, 50);
+        assert_eq!(clean.train_steps, 1);
+        assert_eq!(clean.match_overlap, 80);
     }
 
     #[test]
@@ -229,12 +257,12 @@ mod tests {
             max_splats: 1,
             ..PipelineSettings::from_preset(Preset::Fast)
         };
-        assert_eq!(low.sanitized().max_splats, 100_000);
+        assert_eq!(low.sanitized().max_splats, MAX_SPLATS_MIN);
         let high = PipelineSettings {
-            max_splats: 99_000_000,
+            max_splats: 200_000_000,
             ..PipelineSettings::from_preset(Preset::Fast)
         };
-        assert_eq!(high.sanitized().max_splats, 20_000_000);
+        assert_eq!(high.sanitized().max_splats, MAX_SPLATS_MAX);
     }
 
     #[test]
@@ -251,7 +279,7 @@ mod tests {
             ..PipelineSettings::from_preset(Preset::Fast)
         };
         assert_eq!(settings.longest_edge(), None);
-        assert_eq!(settings.train_resolution(), 1920);
+        assert_eq!(settings.train_resolution(), Some(1920));
     }
 
     #[test]
@@ -334,27 +362,52 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_clamps_max_frames() {
+    fn sanitized_does_not_apply_capture_frame_cap() {
         let low = PipelineSettings {
             max_frames: 1,
             ..PipelineSettings::from_preset(Preset::Fast)
         };
-        assert_eq!(low.sanitized().max_frames, 8);
+        assert_eq!(low.sanitized().max_frames, 1);
         let high = PipelineSettings {
             max_frames: 9_000,
             ..PipelineSettings::from_preset(Preset::Fast)
         };
-        assert_eq!(high.sanitized().max_frames, 800);
-        let mut room = PipelineSettings::from_preset(Preset::Fast);
-        room.capture_mode = CaptureMode::Room;
-        room.max_frames = 9_000;
-        assert_eq!(room.sanitized().max_frames, 800);
+        assert_eq!(high.sanitized().max_frames, 9_000);
         let mut outdoor = PipelineSettings::from_preset(Preset::Fast);
         outdoor.capture_mode = CaptureMode::Outdoor;
-        outdoor.max_frames = 10_000;
-        assert_eq!(outdoor.sanitized().max_frames, 10_000);
         outdoor.max_frames = 20_000;
-        assert_eq!(outdoor.sanitized().max_frames, 10_000);
+        assert_eq!(outdoor.sanitized().max_frames, 20_000);
+        outdoor.max_frames = 80_000;
+        assert_eq!(outdoor.sanitized().max_frames, MAX_FRAMES_MAX);
+    }
+
+    #[test]
+    fn legacy_room_json_hydrates_room_colmap() {
+        let json = r#"{
+            "fps": 1.0,
+            "maxImageSize": 800,
+            "startSeconds": 0.0,
+            "durationSeconds": 0.0,
+            "trainSteps": 5000,
+            "matchOverlap": 15,
+            "captureMode": "room"
+        }"#;
+        let settings: PipelineSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.colmap.is_none());
+        let colmap = settings.sanitized().colmap.expect("hydrated");
+        assert_eq!(colmap.mapper, crate::colmap_knobs::ColmapMapper::Global);
+        assert_eq!(colmap.min_overlap_floor, 20);
+        assert_eq!(colmap.matcher, crate::colmap_knobs::ColmapMatcher::Exhaustive);
+    }
+
+    #[test]
+    fn explicit_zero_overlap_floor_is_kept() {
+        let mut settings = PipelineSettings::from_preset(Preset::Fast);
+        settings.capture_mode = CaptureMode::Room;
+        let mut colmap = ColmapKnobs::for_capture(CaptureMode::Room);
+        colmap.min_overlap_floor = 0;
+        settings.colmap = Some(colmap);
+        assert_eq!(settings.sanitized().colmap_knobs().min_overlap_floor, 0);
     }
 
     #[test]

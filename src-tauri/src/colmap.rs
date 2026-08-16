@@ -1,23 +1,17 @@
-//! COLMAP SfM command sequence. Sequential matching for orbits and long paths;
-//! exhaustive matching for room captures so loops can close (up to 250 frames).
-//! Longer rooms fall back to sequential matching with quadratic overlap.
-//! After matching, Room copies the database and runs `view_graph_calibrator`
-//! then `global_mapper` (COLMAP 4 global SfM, formerly GLOMAP). Object and
-//! Outdoor stay on incremental `mapper`.
+//! COLMAP SfM command sequence. Matcher and mapper come from settings knobs;
+//! named presets still fill those from capture mode. Exhaustive matching falls
+//! back to sequential when the frame count exceeds `exhaustiveFrameLimit`.
 //! Flags match COLMAP 4 (`FeatureExtraction` / `FeatureMatching`, not the old `SiftExtraction.use_gpu`).
 
 use std::path::Path;
 
-use crate::settings::{CaptureMode, PipelineSettings};
+use crate::colmap_knobs::{ColmapMapper, ColmapMatcher};
+use crate::settings::PipelineSettings;
 use crate::sidecar::{path_arg, CommandSpec};
 
-const CAMERA_MODEL: &str = "SIMPLE_RADIAL";
-const EXHAUSTIVE_FRAME_LIMIT: usize = 250;
-const SCENE_MIN_OVERLAP: u32 = 20;
-
-/// Feature extraction, matching, then Room global SfM or incremental mapping.
+/// Feature extraction, matching, then global or incremental mapping from knobs.
 ///
-/// `database` is used by extractor and matcher. Room mapping uses
+/// `database` is used by extractor and matcher. Global mapping uses
 /// `global_database` (a copy the pipeline makes after matching).
 /// `image_list` limits extraction to selected frames when present.
 pub fn reconstruction_specs(
@@ -31,11 +25,12 @@ pub fn reconstruction_specs(
 ) -> Vec<CommandSpec> {
     let settings = settings.sanitized();
     let mode = settings.capture_mode;
+    let knobs = settings.colmap_knobs();
     let mut specs = vec![
         feature_extractor_spec(image_dir, database, settings, image_list).capture(mode),
         matcher_spec(database, settings, frame_count).capture(mode),
     ];
-    if mode == CaptureMode::Room {
+    if knobs.mapper == ColmapMapper::Global {
         specs.push(view_graph_calibrator_spec(global_database).capture(mode));
         specs.push(global_mapper_spec(image_dir, global_database, sparse_dir).capture(mode));
     } else {
@@ -50,6 +45,7 @@ pub fn feature_extractor_spec(
     settings: PipelineSettings,
     image_list: Option<&Path>,
 ) -> CommandSpec {
+    let knobs = settings.colmap_knobs();
     let mut args = vec![
         "feature_extractor".into(),
         "--database_path".into(),
@@ -57,9 +53,9 @@ pub fn feature_extractor_spec(
         "--image_path".into(),
         path_arg(image_dir),
         "--ImageReader.single_camera".into(),
-        "1".into(),
+        if knobs.single_camera { "1" } else { "0" }.into(),
         "--ImageReader.camera_model".into(),
-        CAMERA_MODEL.into(),
+        knobs.camera_model.as_colmap().into(),
         "--FeatureExtraction.use_gpu".into(),
         "0".into(),
     ];
@@ -74,13 +70,13 @@ pub fn feature_extractor_spec(
     CommandSpec::new("colmap", args)
 }
 
-/// Sequential or exhaustive matching depending on capture mode and frame count.
+/// Sequential or exhaustive matching from knobs, with exhaustive falling back by frame count.
 pub fn matcher_spec(
     database: &Path,
     settings: PipelineSettings,
     frame_count: usize,
 ) -> CommandSpec {
-    if uses_exhaustive(settings.capture_mode, frame_count) {
+    if uses_exhaustive(settings, frame_count) {
         exhaustive_matcher_spec(database)
     } else {
         sequential_matcher_spec(database, settings)
@@ -88,6 +84,7 @@ pub fn matcher_spec(
 }
 
 pub fn sequential_matcher_spec(database: &Path, settings: PipelineSettings) -> CommandSpec {
+    let knobs = settings.colmap_knobs();
     let mut args = vec![
         "sequential_matcher".into(),
         "--database_path".into(),
@@ -97,7 +94,7 @@ pub fn sequential_matcher_spec(database: &Path, settings: PipelineSettings) -> C
         "--SequentialMatching.overlap".into(),
         sequential_overlap(settings).to_string(),
     ];
-    if settings.capture_mode == CaptureMode::Room {
+    if knobs.quadratic_overlap {
         args.push("--SequentialMatching.quadratic_overlap".into());
         args.push("1".into());
     }
@@ -134,11 +131,12 @@ pub fn mapper_spec(
         "--Mapper.multiple_models".into(),
         "0".into(),
         "--Mapper.min_model_size".into(),
-        min_model_size(settings.capture_mode).to_string(),
+        settings.colmap_knobs().min_model_size.to_string(),
     ];
-    if settings.capture_mode == CaptureMode::Outdoor {
+    let angle = settings.colmap_knobs().init_min_tri_angle;
+    if angle > 0 {
         args.push("--Mapper.init_min_tri_angle".into());
-        args.push("8".into());
+        args.push(angle.to_string());
     }
     CommandSpec::new("colmap", args)
 }
@@ -171,29 +169,22 @@ pub fn global_mapper_spec(image_dir: &Path, database: &Path, sparse_dir: &Path) 
     )
 }
 
-fn uses_exhaustive(mode: CaptureMode, frame_count: usize) -> bool {
-    mode == CaptureMode::Room && frame_count <= EXHAUSTIVE_FRAME_LIMIT
+fn uses_exhaustive(settings: PipelineSettings, frame_count: usize) -> bool {
+    let knobs = settings.colmap_knobs();
+    knobs.matcher == ColmapMatcher::Exhaustive
+        && frame_count <= knobs.exhaustive_frame_limit as usize
 }
 
 fn sequential_overlap(settings: PipelineSettings) -> u32 {
-    let overlap = settings.sanitized().match_overlap;
-    match settings.capture_mode {
-        CaptureMode::Object => overlap,
-        CaptureMode::Room | CaptureMode::Outdoor => overlap.max(SCENE_MIN_OVERLAP),
-    }
-}
-
-fn min_model_size(mode: CaptureMode) -> u32 {
-    match mode {
-        CaptureMode::Object => 6,
-        CaptureMode::Room | CaptureMode::Outdoor => 10,
-    }
+    let knobs = settings.colmap_knobs();
+    settings.sanitized().match_overlap.max(knobs.min_overlap_floor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::preset::Preset;
+    use crate::settings::CaptureMode;
     use std::path::Path;
 
     fn object_settings() -> PipelineSettings {
@@ -452,5 +443,31 @@ mod tests {
             .args
             .windows(2)
             .any(|w| w[0] == "--image_list_path" && w[1] == "colmap/image_list.txt"));
+    }
+
+    #[test]
+    fn explicit_zero_overlap_floor_is_not_raised() {
+        let mut settings = room_settings();
+        settings.match_overlap = 8;
+        let mut knobs = settings.colmap_knobs();
+        knobs.min_overlap_floor = 0;
+        settings.colmap = Some(knobs);
+        let spec = sequential_matcher_spec(Path::new("db"), settings);
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--SequentialMatching.overlap" && w[1] == "8"));
+    }
+
+    #[test]
+    fn explicit_incremental_mapper_skips_global_on_room_capture() {
+        let mut settings = room_settings();
+        let mut knobs = settings.colmap_knobs();
+        knobs.mapper = crate::colmap_knobs::ColmapMapper::Incremental;
+        settings.colmap = Some(knobs);
+        let specs = colmap_specs(settings, 40);
+        assert_eq!(specs.len(), 3);
+        assert_eq!(subcommand(&specs[2]), "mapper");
+        assert!(specs.iter().all(|s| subcommand(s) != "global_mapper"));
     }
 }

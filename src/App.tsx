@@ -1,16 +1,23 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { getConfig, saveConfig } from "./api";
+import { parseMenuProject, parseMenuView } from "./appMenu";
 import { ArchiveView } from "./components/ArchiveView";
+import { LogWindow } from "./components/LogWindow";
 import { ReconstructView } from "./components/ReconstructView";
 import { SettingsView } from "./components/SettingsView";
 import { SplatWindow } from "./components/SplatWindow";
 import { TitleBar } from "./components/TitleBar";
 import { toggleNativeFullscreen, watchNativeFullscreen } from "./fullscreen";
+import { isLogWindowSearch } from "./logWindow";
 import { splatIdFromSearch } from "./splatWindow";
 import type { AppConfig, AppView } from "./types";
 import "./App.css";
 
 export default function App() {
+  if (isLogWindowSearch(window.location.search)) {
+    return <LogWindow />;
+  }
   const splatId = splatIdFromSearch(window.location.search);
   if (splatId) {
     return <SplatWindow splatId={splatId} />;
@@ -57,6 +64,42 @@ function Shell() {
       stop?.();
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const unsubs: Array<() => void> = [];
+    void (async () => {
+      const offView = await listen<string>("menu-view", (event) => {
+        const next = parseMenuView(event.payload);
+        if (next) {
+          onView(next);
+        }
+      });
+      const offSettings = await listen("menu-settings", () => {
+        setSettingsOpen(true);
+      });
+      const offProject = await listen<string>("menu-project", (event) => {
+        if (!parseMenuProject(event.payload)) {
+          return;
+        }
+        setSettingsOpen(false);
+        setView((current) => (current === "archive" ? density : current));
+      });
+      if (cancelled) {
+        offView();
+        offSettings();
+        offProject();
+        return;
+      }
+      unsubs.push(offView, offSettings, offProject);
+    })();
+    return () => {
+      cancelled = true;
+      for (const off of unsubs) {
+        off();
+      }
+    };
+  }, [config, density]);
 
   async function persist(next: AppConfig) {
     setConfig(await saveConfig(next));

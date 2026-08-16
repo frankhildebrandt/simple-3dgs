@@ -163,7 +163,7 @@ fn archive_outcome(
 ) -> Result<PipelineOutcome, PipelineError> {
     if let Some(id) = layout.archived_id() {
         if let Ok(entry) = library.get(&id) {
-            return             Ok(PipelineOutcome {
+            return Ok(PipelineOutcome {
                 ply: PathBuf::from(entry.ply_path),
                 archive_id: Some(id),
                 archive_error: None,
@@ -366,10 +366,13 @@ fn write_video_frames_manifest(
         .iter()
         .enumerate()
         .map(|(out, &index)| {
-            let score = scores.get(index).copied().unwrap_or(keyframes::CandidateScore {
-                sharpness: 0.0,
-                motion: 0.0,
-            });
+            let score = scores
+                .get(index)
+                .copied()
+                .unwrap_or(keyframes::CandidateScore {
+                    sharpness: 0.0,
+                    motion: 0.0,
+                });
             FrameEntry {
                 name: format!("frame_{:05}.{ext}", out + 1),
                 index,
@@ -389,10 +392,13 @@ fn write_still_frames_manifest(layout: &ProjectLayout) -> Result<(), PipelineErr
         .iter()
         .enumerate()
         .map(|(index, path)| {
-            let score = scores.get(index).copied().unwrap_or(keyframes::CandidateScore {
-                sharpness: 0.0,
-                motion: 0.0,
-            });
+            let score = scores
+                .get(index)
+                .copied()
+                .unwrap_or(keyframes::CandidateScore {
+                    sharpness: 0.0,
+                    motion: 0.0,
+                });
             FrameEntry {
                 name: path
                     .file_name()
@@ -703,7 +709,11 @@ fn run_colmap_logged(
             let changed = snap.ingest(line);
             snap.elapsed_secs = Some(started.elapsed().as_secs());
             let mut ev = events.borrow_mut();
-            ev.log(line);
+            for record in crate::colmap_log::records(line) {
+                if let Some(msg) = crate::colmap_log::ui_log(record) {
+                    ev.log(&msg);
+                }
+            }
             if changed {
                 ev.camera_stats(&snap);
                 ev.progress(Stage::Colmap, snap.percent(), &snap.summary());
@@ -717,9 +727,9 @@ fn run_colmap_logged(
                         Some(frame_total),
                     );
                     ev.sparse_preview(&preview);
-                    ev.camera_stats(&snap);
-                    ev.progress(Stage::Colmap, snap.percent(), &snap.summary());
                 }
+                ev.camera_stats(&snap);
+                ev.progress(Stage::Colmap, snap.percent(), &snap.summary());
             }
         },
         &mut |path| {
@@ -1085,8 +1095,9 @@ mod tests {
         let outcome = run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
         assert!(runner.calls.iter().all(|c| c.sidecar != "colmap"));
         assert_eq!(outcome.completed_stage, Stage::Frames);
-        let frames = FrameManifest::load(&manifest::frames_file(config.project_dir.as_ref().unwrap()))
-            .unwrap();
+        let frames =
+            FrameManifest::load(&manifest::frames_file(config.project_dir.as_ref().unwrap()))
+                .unwrap();
         assert_eq!(frames.frames.len(), 8);
         assert!(frames.frames.iter().all(|f| f.selected));
     }
@@ -1106,7 +1117,10 @@ mod tests {
         let extractor = runner
             .calls
             .iter()
-            .find(|c| c.sidecar == "colmap" && c.args.first().map(String::as_str) == Some("feature_extractor"))
+            .find(|c| {
+                c.sidecar == "colmap"
+                    && c.args.first().map(String::as_str) == Some("feature_extractor")
+            })
             .unwrap();
         assert!(extractor
             .args

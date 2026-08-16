@@ -9,7 +9,7 @@ use crate::archive::ArchiveEntry;
 use crate::colmap_pose::ViewPose;
 use crate::error::PipelineError;
 use crate::project::{OUTPUT_SPZ, VIEW_JSON};
-use crate::settings::CaptureMode;
+use crate::viewer_knobs::ViewerKnobs;
 
 const SCENE_JS: &str = "scene.js";
 
@@ -76,23 +76,31 @@ pub fn viewer_html(entry: &ArchiveEntry, view: Option<&ViewPose>) -> String {
         .settings
         .map(|s| s.capture_mode)
         .unwrap_or_default();
-    let profile = spark_viewer_profile(mode);
-    let move_speed = profile.move_speed;
+    let knobs = entry
+        .meta
+        .settings
+        .map(|s| s.viewer_knobs())
+        .unwrap_or_else(|| ViewerKnobs::for_capture(mode));
+    let move_speed = knobs.move_speed;
+    let fov = knobs.fov;
     let spark_ctor = format!(
-        "const spark = new SparkRenderer({{ renderer, enableLod: true, lodSplatCount: {WEBVIEW_LOD_SPLAT_COUNT}, minAlpha: {:.8}, lodSplatScale: {}, lodRenderScale: {}, behindFoveate: {}, coneFoveate: {}, maxStdDev: {}, clipXY: {}, minPixelRadius: 1, minSortIntervalMs: 8 }});",
-        profile.min_alpha,
-        profile.lod_splat_scale,
-        profile.lod_render_scale,
-        profile.behind_foveate,
-        profile.cone_foveate,
-        profile.max_std_dev,
-        profile.clip_xy
+        "const spark = new SparkRenderer({{ renderer, enableLod: true, lodSplatCount: {}, minAlpha: {:.8}, lodSplatScale: {}, lodRenderScale: {}, behindFoveate: {}, coneFoveate: {}, maxStdDev: {}, clipXY: {}, minPixelRadius: {}, minSortIntervalMs: {} }});",
+        knobs.webview_lod_splat_count,
+        knobs.min_alpha,
+        knobs.lod_splat_scale,
+        knobs.lod_render_scale,
+        knobs.behind_foveate,
+        knobs.cone_foveate,
+        knobs.max_std_dev,
+        knobs.clip_xy,
+        knobs.min_pixel_radius,
+        knobs.min_sort_interval_ms
     );
     let splat_ctor = format!(
         "const splat = new SplatMesh({{ fileBytes: sceneBytes, fileType: \"spz\", fileName: \"{OUTPUT_SPZ}\", lod: true, nonLod: true, lodAbove: {}, raycastable: false }});",
-        profile.lod_above
+        knobs.lod_above
     );
-    let mode_js = view_mode_js(profile.max_std_dev);
+    let mode_js = view_mode_js(&knobs.max_std_dev.to_string(), knobs.min_pixel_radius);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -159,7 +167,7 @@ pub fn viewer_html(entry: &ArchiveEntry, view: Option<&ViewPose>) -> String {
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x101114);
-    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / Math.max(window.innerHeight, 1), 0.01, 1000);
+    const camera = new THREE.PerspectiveCamera({fov}, window.innerWidth / Math.max(window.innerHeight, 1), 0.01, 1000);
     {camera_js}
     const renderer = new THREE.WebGLRenderer({{ antialias: false, alpha: false, powerPreference: "high-performance" }});
     let sharp = false;
@@ -232,71 +240,15 @@ pub fn viewer_html(entry: &ArchiveEntry, view: Option<&ViewPose>) -> String {
     )
 }
 
-const LOD_ABOVE: u32 = 100_000;
-/// Safari/WebView fill-rate budget; Spark's desktop default is 2.5M.
-const WEBVIEW_LOD_SPLAT_COUNT: u32 = 1_500_000;
-const SPARK_MIN_ALPHA: f64 = 0.5 / 255.0;
-const ROOM_MIN_ALPHA: f64 = 2.0 / 255.0;
-
-struct SparkViewerProfile {
-    lod_above: u32,
-    lod_splat_scale: f64,
-    lod_render_scale: f64,
-    behind_foveate: f64,
-    cone_foveate: f64,
-    min_alpha: f64,
-    max_std_dev: &'static str,
-    clip_xy: f64,
-    move_speed: f64,
-}
-
-/// Matches `src/viewerProfile.ts`: LoD for the view cone, higher minAlpha in rooms.
-fn spark_viewer_profile(mode: CaptureMode) -> SparkViewerProfile {
-    match mode {
-        CaptureMode::Room => SparkViewerProfile {
-            lod_above: LOD_ABOVE,
-            lod_splat_scale: 0.7,
-            lod_render_scale: 2.0,
-            behind_foveate: 0.1,
-            cone_foveate: 0.4,
-            min_alpha: ROOM_MIN_ALPHA,
-            max_std_dev: "Math.sqrt(5)",
-            clip_xy: 1.2,
-            move_speed: 0.5,
-        },
-        CaptureMode::Outdoor => SparkViewerProfile {
-            lod_above: LOD_ABOVE,
-            lod_splat_scale: 0.5,
-            lod_render_scale: 3.0,
-            behind_foveate: 0.1,
-            cone_foveate: 0.3,
-            min_alpha: SPARK_MIN_ALPHA,
-            max_std_dev: "Math.sqrt(4)",
-            clip_xy: 1.1,
-            move_speed: 2.0,
-        },
-        CaptureMode::Object => SparkViewerProfile {
-            lod_above: LOD_ABOVE,
-            lod_splat_scale: 1.0,
-            lod_render_scale: 1.5,
-            behind_foveate: 0.2,
-            cone_foveate: 0.5,
-            min_alpha: SPARK_MIN_ALPHA,
-            max_std_dev: "Math.sqrt(5)",
-            clip_xy: 1.2,
-            move_speed: 0.8,
-        },
-    }
-}
-
 /// Matches `src/viewerMode.ts`: Splats keep the profile; dots clamp; discs drop falloff.
-fn view_mode_js(max_std_dev: &str) -> String {
+fn view_mode_js(max_std_dev: &str, min_pixel_radius: f64) -> String {
     format!(
         r#"const MODES = ["splats", "dots", "discs"];
     const LABELS = ["Splats", "Dots", "Discs"];
     let viewMode = 0;
     const modeBtn = document.getElementById("mode");
     const splatMaxStdDev = {max_std_dev};
+    const splatMinPixelRadius = {min_pixel_radius};
     function applyMode() {{
       const name = MODES[viewMode];
       modeBtn.textContent = LABELS[viewMode];
@@ -308,7 +260,7 @@ fn view_mode_js(max_std_dev: &str) -> String {
         return;
       }}
       spark.maxStdDev = splatMaxStdDev;
-      spark.minPixelRadius = 1;
+      spark.minPixelRadius = splatMinPixelRadius;
       spark.maxPixelRadius = 512;
       spark.falloff = name === "discs" ? 0 : 1;
     }}
@@ -364,7 +316,7 @@ mod tests {
     use crate::archive::{ArchiveLibrary, IngestRequest};
     use crate::geo::{GeoFix, GeoSource};
     use crate::preset::Preset;
-    use crate::settings::PipelineSettings;
+    use crate::settings::{CaptureMode, PipelineSettings};
     use tempfile::tempdir;
 
     #[test]
@@ -399,7 +351,7 @@ mod tests {
         assert!(html.contains("lodRenderScale: 1.5"));
         assert!(html.contains("behindFoveate: 0.2"));
         assert!(html.contains("coneFoveate: 0.5"));
-        assert!(html.contains("maxStdDev: Math.sqrt(5)"));
+        assert!(html.contains(&format!("maxStdDev: {}", 5.0_f64.sqrt())));
         assert!(html.contains("clipXY: 1.2"));
         assert!(html.contains("minPixelRadius: 1"));
         assert!(html.contains("minSortIntervalMs: 8"));
@@ -419,7 +371,7 @@ mod tests {
         assert!(html.contains("spark.minPixelRadius = 1.5"));
         assert!(html.contains("spark.maxPixelRadius = 2"));
         assert!(html.contains("spark.falloff = 0"));
-        assert!(html.contains("const splatMaxStdDev = Math.sqrt(5)"));
+        assert!(html.contains(&format!("const splatMaxStdDev = {}", 5.0_f64.sqrt())));
         assert!(html.contains("new SparkControls"));
         assert!(html.contains("controls.update(camera)"));
         assert!(html.contains("keycodeMoveMapping"));
@@ -462,8 +414,43 @@ mod tests {
         assert!(html.contains("behindFoveate: 0.1"));
         assert!(html.contains("coneFoveate: 0.4"));
         assert!(html.contains("clipXY: 1.2"));
-        assert!(html.contains(&format!("minAlpha: {:.8}", ROOM_MIN_ALPHA)));
+        assert!(html.contains(&format!("minAlpha: {:.8}", crate::viewer_knobs::ROOM_MIN_ALPHA)));
         assert!(html.contains("controls.fpsMovement.moveSpeed = 0.5"));
+    }
+
+    #[test]
+    fn html_uses_explicit_viewer_knobs() {
+        let mut settings = PipelineSettings::from_preset(Preset::Balanced);
+        settings.capture_mode = CaptureMode::Object;
+        let mut viewer = settings.viewer_knobs();
+        viewer.min_alpha = 0.02;
+        viewer.move_speed = 3.5;
+        viewer.fov = 75.0;
+        settings.viewer = Some(viewer);
+        let html = viewer_html(
+            &ArchiveEntry {
+                meta: crate::archive::ArchiveMeta {
+                    id: "x".into(),
+                    title: "Custom".into(),
+                    created_at: "2026-08-15T12:00:00Z".into(),
+                    source_kind: "video".into(),
+                    source_name: "clip.mp4".into(),
+                    settings: Some(settings),
+                    frame_count: 80,
+                    ply_bytes: 12,
+                    geo: None,
+                    poster: None,
+                },
+                ply_path: "/tmp/scene.ply".into(),
+                poster_path: None,
+                dir: "/tmp".into(),
+                has_ply: true,
+            },
+            None,
+        );
+        assert!(html.contains("minAlpha: 0.02000000"));
+        assert!(html.contains("controls.fpsMovement.moveSpeed = 3.5"));
+        assert!(html.contains("PerspectiveCamera(75"));
     }
 
     #[test]
@@ -494,10 +481,10 @@ mod tests {
         assert!(html.contains("lodSplatScale: 0.5"));
         assert!(html.contains("lodRenderScale: 3"));
         assert!(html.contains("coneFoveate: 0.3"));
-        assert!(html.contains("maxStdDev: Math.sqrt(4)"));
+        assert!(html.contains(&format!("maxStdDev: {}", 4.0_f64.sqrt())));
         assert!(html.contains("clipXY: 1.1"));
         assert!(html.contains("controls.fpsMovement.moveSpeed = 2"));
-        assert!(html.contains("const splatMaxStdDev = Math.sqrt(4)"));
+        assert!(html.contains(&format!("const splatMaxStdDev = {}", 4.0_f64.sqrt())));
     }
 
     #[test]

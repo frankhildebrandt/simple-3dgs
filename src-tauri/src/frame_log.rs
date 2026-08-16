@@ -110,12 +110,15 @@ impl FrameSnapshot {
 
     /// Maps this pass onto 0–100. Candidates occupy 0–50, keyframes 50–100.
     pub fn percent(&self) -> u8 {
-        let fraction = if let (Some(out), Some(dur)) = (self.out_secs, self.duration_secs.filter(|d| *d > 0.0))
+        let fraction = if let (Some(out), Some(dur)) =
+            (self.out_secs, self.duration_secs.filter(|d| *d > 0.0))
         {
             ((out / dur) * 100.0).clamp(0.0, 100.0) as u8
         } else {
             match (self.current, self.total.filter(|n| *n > 0)) {
-                (Some(cur), Some(total)) => (u64::from(cur) * 100 / u64::from(total)).min(100) as u8,
+                (Some(cur), Some(total)) => {
+                    (u64::from(cur) * 100 / u64::from(total)).min(100) as u8
+                }
                 _ => 0,
             }
         };
@@ -153,7 +156,9 @@ impl FrameSnapshot {
 }
 
 fn effective_duration(parsed: f32, previous: Option<f32>) -> f32 {
-    previous.filter(|d| *d > 0.0 && *d <= parsed).unwrap_or(parsed)
+    previous
+        .filter(|d| *d > 0.0 && *d <= parsed)
+        .unwrap_or(parsed)
 }
 
 fn parse_progress_field(line: &str) -> Option<(&str, &str)> {

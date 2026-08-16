@@ -102,6 +102,7 @@ export function SplatWindow({ splatId }: Props) {
         key={`${entry.id}:${entry.plyPath}`}
         plyPath={entry.plyPath}
         captureMode={entry.settings?.captureMode ?? "object"}
+        viewer={entry.settings?.viewer}
         fullscreen={fullscreen}
         onToggleFullscreen={() => {
           void toggleNativeFullscreen().then(setFullscreen);

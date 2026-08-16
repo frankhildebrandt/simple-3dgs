@@ -1,3 +1,4 @@
+import { openLogWindow } from "../logWindows";
 import type { CameraStats, FrameStats, ProgressEvent, RunStatus, TrainStats } from "../types";
 import { formatPercent, stagePercents } from "../stageProgress";
 
@@ -7,7 +8,6 @@ type Props = {
   frames: FrameStats | null;
   cameras: CameraStats | null;
   train: TrainStats | null;
-  logs: string[];
   error: string | null;
 };
 
@@ -71,7 +71,7 @@ function cameraStepLabel(step: CameraStats["step"]): string {
   return "Mapping";
 }
 
-export function RunProgress({ status, progress, frames, cameras, train, logs, error }: Props) {
+export function RunProgress({ status, progress, frames, cameras, train, error }: Props) {
   const percents = stagePercents(progress, status);
   const stats = frames && progress?.stage === "frames"
     ? "frames"
@@ -83,24 +83,29 @@ export function RunProgress({ status, progress, frames, cameras, train, logs, er
 
   return (
     <section className="progress">
-      <ol className="stages">
-        {STAGES.map((stage) => {
-          const active = progress?.stage === stage.id && status === "running";
-          const done =
-            status === "done" ||
-            percents[stage.id] === 100 ||
-            (progress !== null &&
-              STAGES.findIndex((s) => s.id === progress.stage) >
-                STAGES.findIndex((s) => s.id === stage.id));
-          const pct = percents[stage.id];
-          return (
-            <li key={stage.id} className={done ? "done" : active ? "active" : ""}>
-              <span>{stage.label}</span>
-              {pct != null ? <span className="stage-pct">{formatPercent(pct)}</span> : null}
-            </li>
-          );
-        })}
-      </ol>
+      <div className="progress-head">
+        <ol className="stages">
+          {STAGES.map((stage) => {
+            const active = progress?.stage === stage.id && status === "running";
+            const done =
+              status === "done" ||
+              percents[stage.id] === 100 ||
+              (progress !== null &&
+                STAGES.findIndex((s) => s.id === progress.stage) >
+                  STAGES.findIndex((s) => s.id === stage.id));
+            const pct = percents[stage.id];
+            return (
+              <li key={stage.id} className={done ? "done" : active ? "active" : ""}>
+                <span>{stage.label}</span>
+                {pct != null ? <span className="stage-pct">{formatPercent(pct)}</span> : null}
+              </li>
+            );
+          })}
+        </ol>
+        <button type="button" className="log-open" onClick={() => void openLogWindow()}>
+          Log
+        </button>
+      </div>
       <p className="progress-message">
         {error ?? progress?.message ?? (status === "idle" ? "Idle" : status === "paused" ? "Paused" : status)}
       </p>
@@ -146,7 +151,7 @@ export function RunProgress({ status, progress, frames, cameras, train, logs, er
           <div>
             <dt>Images</dt>
             <dd>
-              {formatCount(cameras.processed ?? cameras.registered)}
+              {formatCount(cameras.registered ?? cameras.processed)}
               {cameras.total != null ? ` / ${formatCount(cameras.total)}` : ""}
             </dd>
           </div>
@@ -158,6 +163,18 @@ export function RunProgress({ status, progress, frames, cameras, train, logs, er
             <dt>Points</dt>
             <dd>{formatCount(cameras.points)}</dd>
           </div>
+          {cameras.trying != null ? (
+            <div>
+              <dt>Trying</dt>
+              <dd>#{cameras.trying}</dd>
+            </div>
+          ) : null}
+          {cameras.failed != null && cameras.failed > 0 ? (
+            <div>
+              <dt>Failed</dt>
+              <dd>{formatCount(cameras.failed)}</dd>
+            </div>
+          ) : null}
           <div>
             <dt>Time</dt>
             <dd>{formatElapsed(cameras.elapsedSecs)}</dd>
@@ -202,9 +219,6 @@ export function RunProgress({ status, progress, frames, cameras, train, logs, er
           </div>
         </dl>
       ) : null}
-      <pre className="logs" aria-label="Pipeline log">
-        {logs.slice(-80).join("\n")}
-      </pre>
     </section>
   );
 }

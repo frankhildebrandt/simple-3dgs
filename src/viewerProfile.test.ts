@@ -11,7 +11,9 @@ import {
   sparkTuning,
   splatLoadFlags,
   viewerProfile,
+  viewerProfileFromKnobs,
 } from "./viewerProfile";
+import { viewerKnobsFor } from "./viewerKnobs";
 
 describe("viewerProfile", () => {
   it("builds LoD for objects only above a splat threshold", () => {
@@ -49,6 +51,19 @@ describe("viewerProfile", () => {
     expect(profile.minAlpha).toBe(SPARK_MIN_ALPHA);
     expect(profile.maxStdDev).toBe(OUTDOOR_MAX_STD_DEV);
     expect(profile.clipXY).toBe(1.1);
+  });
+
+  it("builds a profile from stored knobs and still raises lodAbove while live", () => {
+    const knobs = {
+      ...viewerKnobsFor("object"),
+      lodSplatScale: 0.3,
+      minAlpha: 0.02,
+    };
+    const profile = viewerProfileFromKnobs(knobs);
+    expect(profile.lodSplatScale).toBe(0.3);
+    expect(profile.minAlpha).toBe(0.02);
+    expect(profile.lodAbove).toBe(LOD_ABOVE);
+    expect(viewerProfileFromKnobs(knobs, true).lodAbove).toBe(LIVE_LOD_ABOVE);
   });
 
   it("keeps lod on and raises lodAbove while a live training preview is showing", () => {

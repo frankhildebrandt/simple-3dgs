@@ -148,6 +148,7 @@ export function ArchiveDetail({ entry, onClose, onPoster }: Props) {
         key={`${entry.id}:${entry.plyPath}`}
         plyPath={entry.plyPath}
         captureMode={captureMode}
+        viewer={entry.settings?.viewer}
         onSetPreview={async (jpegBase64) => {
           await setArchivePoster(entry.id, jpegBase64);
           onPoster();

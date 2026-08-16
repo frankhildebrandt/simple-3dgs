@@ -1,4 +1,4 @@
-import { MIN_PIXEL_RADIUS, type ViewerProfile } from "./viewerProfile";
+import type { ViewerProfile } from "./viewerProfile";
 
 export type ViewerMode = "splats" | "dots" | "discs";
 
@@ -24,7 +24,7 @@ export type SparkModeTarget = {
   falloff: number;
 };
 
-const MODE_ORDER: ViewerMode[] = ["splats", "dots", "discs"];
+export const VIEWER_MODES: ViewerMode[] = ["splats", "dots", "discs"];
 
 const MODE_LABEL: Record<ViewerMode, string> = {
   splats: "Splats",
@@ -34,7 +34,7 @@ const MODE_LABEL: Record<ViewerMode, string> = {
 
 /** Returns the next display mode in Splats → Dots → Discs. */
 export function nextViewerMode(mode: ViewerMode): ViewerMode {
-  return MODE_ORDER[(MODE_ORDER.indexOf(mode) + 1) % MODE_ORDER.length];
+  return VIEWER_MODES[(VIEWER_MODES.indexOf(mode) + 1) % VIEWER_MODES.length];
 }
 
 /** Button label for the current display mode. */
@@ -58,14 +58,14 @@ export function viewerModeTuning(mode: ViewerMode, profile: ViewerProfile): View
     case "discs":
       return {
         maxStdDev: profile.maxStdDev,
-        minPixelRadius: MIN_PIXEL_RADIUS,
+        minPixelRadius: profile.minPixelRadius,
         maxPixelRadius: SPLAT_MAX_PIXEL_RADIUS,
         falloff: DISC_FALLOFF,
       };
     case "splats":
       return {
         maxStdDev: profile.maxStdDev,
-        minPixelRadius: MIN_PIXEL_RADIUS,
+        minPixelRadius: profile.minPixelRadius,
         maxPixelRadius: SPLAT_MAX_PIXEL_RADIUS,
         falloff: SPLAT_FALLOFF,
       };

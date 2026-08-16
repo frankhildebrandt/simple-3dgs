@@ -1,6 +1,22 @@
-export type Preset = "fast" | "balanced" | "quality";
+import type { BrushKnobs } from "./brushKnobs";
+import type { CaptureMode } from "./captureMode";
+import type { ColmapKnobs } from "./colmapKnobs";
+import type { ExtractKnobs } from "./extractKnobs";
+import { defaultsFor, knobsEqual } from "./knobDefaults";
+import type { ViewerKnobs } from "./viewerKnobs";
 
-export type CaptureMode = "object" | "room" | "outdoor";
+export type NamedPreset = "fast" | "balanced" | "quality";
+
+export type Preset = NamedPreset | "custom";
+
+export type { CaptureMode };
+export type { ColmapCameraModel, ColmapKnobs, ColmapMatcher, ColmapMapper } from "./colmapKnobs";
+export type { BrushKnobs, ExtractKnobs, ViewerKnobs };
+export { DEFAULT_BRUSH_KNOBS } from "./brushKnobs";
+export { defaultsFor };
+export { DEFAULT_EXTRACT_KNOBS } from "./extractKnobs";
+export { colmapKnobsFor } from "./colmapKnobs";
+export { viewerKnobsFor } from "./viewerKnobs";
 
 export type SourceKind = "video" | "images";
 
@@ -46,6 +62,8 @@ export type CameraStats = {
   matches?: number | null;
   registered?: number | null;
   points?: number | null;
+  trying?: number | null;
+  failed?: number | null;
   elapsedSecs?: number | null;
   etaSecs?: number | null;
 };
@@ -106,6 +124,10 @@ export type PipelineSettings = {
   maxFrames: number;
   extractMode: ExtractMode;
   extractQuality: number;
+  extract: ExtractKnobs;
+  colmap: ColmapKnobs;
+  brush: BrushKnobs;
+  viewer: ViewerKnobs;
 };
 
 export type PipelineRequest = {
@@ -163,7 +185,9 @@ export type RunResult = {
   projectDir: string;
 };
 
-export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
+const OBJECT_KNOBS = defaultsFor("object");
+
+export const PRESET_SETTINGS: Record<NamedPreset, PipelineSettings> = {
   fast: {
     fps: 1,
     maxImageSize: 800,
@@ -178,6 +202,7 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     maxFrames: 120,
     extractMode: "density",
     extractQuality: 55,
+    ...OBJECT_KNOBS,
   },
   balanced: {
     fps: 2,
@@ -193,6 +218,7 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     maxFrames: 250,
     extractMode: "density",
     extractQuality: 55,
+    ...OBJECT_KNOBS,
   },
   quality: {
     fps: 4,
@@ -208,31 +234,91 @@ export const PRESET_SETTINGS: Record<Preset, PipelineSettings> = {
     maxFrames: 500,
     extractMode: "density",
     extractQuality: 55,
+    ...OBJECT_KNOBS,
   },
 };
 
-/** Hard video keyframe cap. Outdoor paths can run much longer than orbits or rooms. */
+/** Hard video keyframe cap used when applying named presets. */
 export function maxFramesCap(mode: CaptureMode): number {
   return mode === "outdoor" ? 10_000 : 800;
 }
 
-/** Returns the named preset when core knobs still match, ignoring clip trim. */
-export function matchingPreset(settings: PipelineSettings): Preset | null {
-  if (settings.extractMode === "change") {
-    return null;
+export type PipelineSettingsInput = Omit<
+  PipelineSettings,
+  "extract" | "colmap" | "brush" | "viewer"
+> & {
+  extract?: ExtractKnobs;
+  colmap?: ColmapKnobs;
+  brush?: BrushKnobs;
+  viewer?: ViewerKnobs;
+};
+
+/** Fills missing nested groups from capture mode so legacy project JSON still matches. */
+export function hydrateSettings(settings: PipelineSettingsInput): PipelineSettings {
+  const fallback = defaultsFor(settings.captureMode);
+  return {
+    ...settings,
+    extract: settings.extract ?? fallback.extract,
+    colmap: settings.colmap ?? fallback.colmap,
+    brush: settings.brush ?? fallback.brush,
+    viewer: settings.viewer ?? fallback.viewer,
+  };
+}
+
+/**
+ * Applies a named recipe. Keeps clip trim, still format, and capture mode, then
+ * resets nested knobs to that capture type's defaults.
+ */
+export function applyNamedPreset(id: NamedPreset, current: PipelineSettings): PipelineSettings {
+  const recipe = PRESET_SETTINGS[id];
+  return {
+    ...recipe,
+    startSeconds: current.startSeconds,
+    durationSeconds: current.durationSeconds,
+    frameFormat: current.frameFormat,
+    captureMode: current.captureMode,
+    ...defaultsFor(current.captureMode),
+  };
+}
+
+/** Named capture change also reclamps frames and resets nested knobs. Custom only sets the mode. */
+export function applyCaptureMode(settings: PipelineSettings, mode: CaptureMode): PipelineSettings {
+  if (matchingPreset(settings) === "custom") {
+    return { ...settings, captureMode: mode };
+  }
+  return {
+    ...settings,
+    captureMode: mode,
+    maxFrames: Math.min(settings.maxFrames, maxFramesCap(mode)),
+    ...defaultsFor(mode),
+  };
+}
+export function matchingPreset(settings: PipelineSettings): Preset {
+  const hydrated = hydrateSettings(settings);
+  if (hydrated.extractMode === "change") {
+    return "custom";
+  }
+  const expected = defaultsFor(hydrated.captureMode);
+  if (
+    !knobsEqual(hydrated.extract, expected.extract) ||
+    !knobsEqual(hydrated.colmap, expected.colmap) ||
+    !knobsEqual(hydrated.brush, expected.brush) ||
+    !knobsEqual(hydrated.viewer, expected.viewer)
+  ) {
+    return "custom";
   }
   for (const id of ["fast", "balanced", "quality"] as const) {
     const preset = PRESET_SETTINGS[id];
     if (
-      preset.fps === settings.fps &&
-      preset.maxImageSize === settings.maxImageSize &&
-      preset.trainSteps === settings.trainSteps &&
-      preset.matchOverlap === settings.matchOverlap &&
-      preset.maxSplats === settings.maxSplats &&
-      preset.maxFrames === settings.maxFrames
+      preset.fps === hydrated.fps &&
+      preset.maxImageSize === hydrated.maxImageSize &&
+      preset.trainSteps === hydrated.trainSteps &&
+      preset.matchOverlap === hydrated.matchOverlap &&
+      preset.maxSplats === hydrated.maxSplats &&
+      preset.maxFrames === hydrated.maxFrames
     ) {
       return id;
     }
   }
-  return null;
+  return "custom";
 }

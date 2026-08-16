@@ -70,20 +70,23 @@ export function DropZone({ sourcePath, sourceKind, disabled, onSource }: Props) 
     : "Drop a video, or choose a file / image folder";
 
   return (
-    <section
+    <fieldset
       className="dropzone"
       title="Drop a video file or an image folder"
       data-hint="Drop a video file or an image folder"
     >
-      <p className="dropzone-label">{label}</p>
-      <div className="row">
+      <legend>Source</legend>
+      <p className="inspector-path" title={label}>
+        {label}
+      </p>
+      <div className="inspector-btns">
         <button type="button" disabled={disabled} onClick={() => void pickVideo()}>
-          Choose video
+          Video
         </button>
         <button type="button" disabled={disabled} onClick={() => void pickImages()}>
-          Choose image folder
+          Folder
         </button>
       </div>
-    </section>
+    </fieldset>
   );
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   cancelPipeline,
@@ -9,7 +9,9 @@ import {
   openProject,
   startPipeline,
 } from "../api";
+import { parseMenuProject } from "../appMenu";
 import { expertCanRun } from "../expertActions";
+import { pickProjectDir } from "../projectDialog";
 import type {
   AppConfig,
   CameraStats,
@@ -24,7 +26,7 @@ import type {
   Stage,
   TrainStats,
 } from "../types";
-import { PRESET_SETTINGS } from "../types";
+import { hydrateSettings, matchingPreset, PRESET_SETTINGS } from "../types";
 import { CaptureHints } from "./CaptureHints";
 import { CaptureModePicker } from "./CaptureModePicker";
 import { CameraPreview } from "./CameraPreview";
@@ -64,7 +66,6 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
   const [force, setForce] = useState(false);
   const [status, setStatus] = useState<RunStatus>("idle");
   const [progress, setProgress] = useState<ProgressEvent | null>(null);
-  const [logs, setLogs] = useState<string[]>([]);
   const [train, setTrain] = useState<TrainStats | null>(null);
   const [frameStats, setFrameStats] = useState<FrameStats | null>(null);
   const [cameraStats, setCameraStats] = useState<CameraStats | null>(null);
@@ -111,9 +112,6 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
     };
     void (async () => {
       await bind<ProgressEvent>("pipeline-progress", setProgress);
-      await bind<string>("pipeline-log", (line) => {
-        setLogs((prev) => [...prev, line]);
-      });
       await bind<TrainStats>("pipeline-train-stats", setTrain);
       await bind<FrameStats>("pipeline-frame-stats", setFrameStats);
       await bind<CameraStats>("pipeline-camera-stats", setCameraStats);
@@ -157,7 +155,7 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
     setSourcePath(entry.sourcePath);
     setSourceKind(entry.sourceKind === "images" ? "images" : "video");
     if (entry.settings) {
-      setSettings(entry.settings);
+      setSettings(hydrateSettings(entry.settings));
     }
     const stage = stageFromProject(entry);
     setCompleted(stage);
@@ -179,6 +177,53 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
       setSparse(null);
     }
   }
+
+  function resetProject() {
+    setProject(null);
+    setCompleted(null);
+    setStatus("idle");
+    setPlyPath(null);
+    setFrames([]);
+    setFramePath(null);
+    setSparse(null);
+    setProgress(null);
+    setError(null);
+  }
+
+  const runningRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    let stop: (() => void) | undefined;
+    void listen<string>("menu-project", (event) => {
+      const action = parseMenuProject(event.payload);
+      if (!action || runningRef.current) {
+        return;
+      }
+      if (action === "new") {
+        resetProject();
+        return;
+      }
+      void pickProjectDir().then((path) => {
+        if (!path) {
+          return;
+        }
+        return openProject(path).then(applyProject);
+      }).catch((err: unknown) => {
+        setError(err instanceof Error ? err.message : String(err));
+      });
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      stop = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, []);
 
   async function ensureProject(): Promise<ProjectEntry | null> {
     if (project) {
@@ -217,7 +262,6 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
     }
     setStatus("running");
     setError(null);
-    setLogs([]);
     setTrain(null);
     setFrameStats(null);
     setCameraStats(null);
@@ -278,6 +322,7 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
   }
 
   const running = status === "running";
+  runningRef.current = running;
   const hasProject = Boolean(project || (sourcePath && config));
   const canEasy =
     Boolean(sourcePath && config?.archiveDir) && !running;
@@ -294,50 +339,44 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
   return (
     <div className="app">
       <aside className="sidebar">
-        {density === "expert" ? (
-          <ProjectPicker
-            project={project}
-            projects={projects}
+        <div className="inspector">
+          {density === "expert" ? (
+            <ProjectPicker
+              project={project}
+              projects={projects}
+              disabled={running}
+              onOpen={(path) => {
+                void openProject(path).then(applyProject).catch((err: unknown) => {
+                  setError(err instanceof Error ? err.message : String(err));
+                });
+              }}
+            />
+          ) : null}
+          <DropZone
+            sourcePath={sourcePath}
+            sourceKind={sourceKind}
             disabled={running}
-            onNew={() => {
-              setProject(null);
-              setCompleted(null);
-              setStatus("idle");
-              setPlyPath(null);
-              setFrames([]);
-              setFramePath(null);
-              setSparse(null);
-              setProgress(null);
-              setError(null);
-            }}
-            onOpen={(path) => {
-              void openProject(path).then(applyProject).catch((err: unknown) => {
-                setError(err instanceof Error ? err.message : String(err));
-              });
-            }}
+            onSource={onSource}
           />
-        ) : null}
-        <DropZone
-          sourcePath={sourcePath}
-          sourceKind={sourceKind}
-          disabled={running}
-          onSource={onSource}
-        />
-        <CaptureModePicker
-          value={settings}
-          disabled={running}
-          onChange={setSettings}
-          onHelp={() => setHintsOpen(true)}
-        />
-        <PresetPicker value={settings} disabled={running} onChange={setSettings} />
-        {density === "expert" ? (
-          <>
+          <section className="inspector-block">
+            <h2>Setup</h2>
+            <CaptureModePicker
+              value={settings}
+              disabled={running}
+              onChange={setSettings}
+              onHelp={() => setHintsOpen(true)}
+            />
+            <PresetPicker value={settings} disabled={running} onChange={setSettings} />
+          </section>
+          {density === "expert" || matchingPreset(settings) === "custom" ? (
             <SettingsPanel
               value={settings}
               sourceKind={sourceKind}
               disabled={running}
               onChange={setSettings}
             />
+          ) : null}
+          {density === "expert" ? (
             <label
               className="force"
               title="Ignore cached stages and run the pipeline from scratch"
@@ -351,10 +390,10 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
               />
               Rebuild from scratch
             </label>
-          </>
-        ) : null}
+          ) : null}
+        </div>
         {density === "expert" ? (
-          <div className="row">
+          <div className="inspector-actions">
             <button
               type="button"
               className="primary"
@@ -382,7 +421,7 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
             </button>
           </div>
         ) : (
-          <div className="row">
+          <div className="inspector-actions">
             <button type="button" className="primary" disabled={!canEasy} onClick={() => void runUntil("train")}>
               Reconstruct
             </button>
@@ -401,6 +440,7 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
           <SplatViewer
             plyPath={plyPath}
             captureMode={settings.captureMode}
+            viewer={settings.viewer}
             live={running}
             fullscreen={fullscreen}
             onToggleFullscreen={onToggleFullscreen}
@@ -412,7 +452,6 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
           frames={frameStats}
           cameras={cameraStats}
           train={train}
-          logs={logs}
           error={error}
         />
       </main>

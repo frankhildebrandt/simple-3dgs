@@ -254,7 +254,10 @@ mod tests {
         let path = frames_file(dir.path());
         manifest.save(&path).unwrap();
         let loaded = FrameManifest::load(&path).unwrap();
-        assert_eq!(loaded.selected_names(), vec!["frame_00001.jpg", "frame_00003.jpg"]);
+        assert_eq!(
+            loaded.selected_names(),
+            vec!["frame_00001.jpg", "frame_00003.jpg"]
+        );
         let list = dir.path().join(IMAGE_LIST_FILE);
         write_image_list(&list, &loaded.selected_names()).unwrap();
         let text = fs::read_to_string(&list).unwrap();
@@ -282,7 +285,10 @@ mod tests {
 
     #[test]
     fn title_from_video_stem() {
-        assert_eq!(title_from_source(Path::new("/tmp/Kitchen_orbit.mov")), "Kitchen orbit");
+        assert_eq!(
+            title_from_source(Path::new("/tmp/Kitchen_orbit.mov")),
+            "Kitchen orbit"
+        );
         assert_eq!(title_from_source(Path::new("/")), "Untitled");
     }
 }

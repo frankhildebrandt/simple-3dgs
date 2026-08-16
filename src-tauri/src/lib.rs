@@ -1,17 +1,23 @@
 mod app_config;
+mod app_menu;
 mod archive;
 mod brush;
+mod brush_knobs;
+mod capture_mode;
 mod colmap;
+mod colmap_knobs;
 mod colmap_log;
 mod colmap_pose;
 mod commands;
 mod duration;
 mod error;
+mod extract_knobs;
 mod ffmpeg;
 mod frame_log;
 mod geo;
 mod html_export;
 mod keyframes;
+mod log_buffer;
 mod manifest;
 mod pipeline;
 mod preset;
@@ -19,6 +25,7 @@ mod project;
 mod settings;
 mod sidecar;
 mod train_log;
+mod viewer_knobs;
 
 use commands::AppState;
 
@@ -34,6 +41,9 @@ pub fn run() {
             // TCC returns EPERM without a prompt (IPC commands run on a worker).
             if let Err(err) = commands::load_config(app.handle()) {
                 eprintln!("archive access: {err}");
+            }
+            if let Err(err) = app_menu::install(app.handle()) {
+                eprintln!("app menu: {err}");
             }
             Ok(())
         })
@@ -60,6 +70,7 @@ pub fn run() {
             commands::list_projects,
             commands::list_project_frames,
             commands::get_sparse_preview,
+            commands::pipeline_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

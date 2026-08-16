@@ -106,3 +106,7 @@ export function listProjectFrames(projectDir: string): Promise<ProjectFrame[]> {
 export function getSparsePreview(projectDir: string): Promise<SparsePreview> {
   return invoke<SparsePreview>("get_sparse_preview", { projectDir });
 }
+
+export function getPipelineLogs(): Promise<string[]> {
+  return invoke<string[]>("pipeline_logs");
+}

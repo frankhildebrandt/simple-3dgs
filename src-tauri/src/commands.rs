@@ -15,6 +15,7 @@ use crate::colmap_pose::{self, SparsePreview};
 use crate::error::PipelineError;
 use crate::frame_log::FrameSnapshot;
 use crate::html_export;
+use crate::log_buffer::LogBuffer;
 use crate::manifest::{self, ProjectManifest};
 use crate::pipeline::{InputKind, PipelineConfig, PipelineEvents};
 use crate::project::{self, ProjectLayout, Stage};
@@ -27,6 +28,7 @@ use tauri::ipc::{InvokeBody, Request, Response};
 pub struct AppState {
     pub cancel: CancelFlag,
     pub running: Mutex<bool>,
+    pub logs: Mutex<LogBuffer>,
 }
 
 impl AppState {
@@ -34,6 +36,7 @@ impl AppState {
         Self {
             cancel: CancelFlag::new(),
             running: Mutex::new(false),
+            logs: Mutex::new(LogBuffer::new()),
         }
     }
 }
@@ -140,6 +143,11 @@ impl PipelineEvents for TauriEvents {
     }
 
     fn log(&mut self, line: &str) {
+        if let Some(state) = self.app.try_state::<AppState>() {
+            if let Ok(mut logs) = state.logs.lock() {
+                logs.push(line);
+            }
+        }
         let _ = self.app.emit("pipeline-log", line.to_string());
     }
 
@@ -187,6 +195,10 @@ pub async fn start_pipeline(
         *running = true;
     }
     state.cancel.reset();
+    if let Ok(mut logs) = state.logs.lock() {
+        logs.clear();
+    }
+    let _ = app.emit("pipeline-log-reset", ());
 
     let kind = match request.source_kind.as_str() {
         "images" => InputKind::Images,
@@ -258,6 +270,13 @@ pub fn cancel_pipeline(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Snapshot of the current reconstruction log for the dedicated log window.
+#[tauri::command]
+pub fn pipeline_logs(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let logs = state.logs.lock().map_err(|err| err.to_string())?;
+    Ok(logs.snapshot())
+}
+
 #[tauri::command]
 pub fn get_config(app: AppHandle) -> Result<AppConfig, String> {
     load_config(&app)
@@ -272,8 +291,18 @@ pub fn save_config(app: AppHandle, mut config: AppConfig) -> Result<AppConfig, S
     std::fs::create_dir_all(&archive)
         .map_err(|err| PipelineError::from_io_path(err, &archive).to_string())?;
     if !config.temp_project {
-        if config.projects_dir.as_deref().unwrap_or("").trim().is_empty()
-            && config.project_dir.as_deref().unwrap_or("").trim().is_empty()
+        if config
+            .projects_dir
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+            && config
+                .project_dir
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
         {
             let documents = app.path().document_dir().map_err(|err| err.to_string())?;
             config.projects_dir = Some(
@@ -430,7 +459,10 @@ fn parse_until(value: &str) -> Stage {
 }
 
 #[tauri::command]
-pub fn create_project(app: AppHandle, request: CreateProjectRequest) -> Result<ProjectEntry, String> {
+pub fn create_project(
+    app: AppHandle,
+    request: CreateProjectRequest,
+) -> Result<ProjectEntry, String> {
     let source = PathBuf::from(&request.source_path);
     let title = request
         .title
@@ -479,13 +511,17 @@ pub fn open_project(path: String) -> Result<ProjectEntry, String> {
 }
 
 #[tauri::command]
-pub fn list_projects(app: AppHandle, projects_dir: Option<String>) -> Result<Vec<ProjectEntry>, String> {
+pub fn list_projects(
+    app: AppHandle,
+    projects_dir: Option<String>,
+) -> Result<Vec<ProjectEntry>, String> {
     let root = resolve_projects_dir(&app, projects_dir.as_deref())?;
     if !root.is_dir() {
         return Ok(Vec::new());
     }
     let mut entries = Vec::new();
-    let read = fs::read_dir(&root).map_err(|err| PipelineError::from_io_path(err, &root).to_string())?;
+    let read =
+        fs::read_dir(&root).map_err(|err| PipelineError::from_io_path(err, &root).to_string())?;
     for entry in read.flatten() {
         let path = entry.path();
         if path.is_dir() && manifest::project_file(&path).is_file() {
@@ -526,7 +562,11 @@ pub fn list_project_frames(project_dir: String) -> Result<Vec<ProjectFrame>, Str
             .frames
             .into_iter()
             .map(|frame| ProjectFrame {
-                path: layout.frames_dir().join(&frame.name).to_string_lossy().into_owned(),
+                path: layout
+                    .frames_dir()
+                    .join(&frame.name)
+                    .to_string_lossy()
+                    .into_owned(),
                 name: frame.name,
                 index: frame.index,
                 sharpness: frame.sharpness,
@@ -557,7 +597,8 @@ fn resolve_projects_dir(app: &AppHandle, override_dir: Option<&str>) -> Result<P
 }
 
 fn project_entry(root: &Path) -> Result<ProjectEntry, String> {
-    let mut manifest = ProjectManifest::load(&manifest::project_file(root)).map_err(|err| err.to_string())?;
+    let mut manifest =
+        ProjectManifest::load(&manifest::project_file(root)).map_err(|err| err.to_string())?;
     let layout = ProjectLayout::new(root);
     if layout.is_complete(Stage::Train) {
         manifest.stage = "train".into();
