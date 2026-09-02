@@ -1,0 +1,1965 @@
+diff --git a/src/colmap/feature/sift.cc b/src/colmap/feature/sift.cc
+index 948999f7..d483283e 100644
+--- a/src/colmap/feature/sift.cc
++++ b/src/colmap/feature/sift.cc
+@@ -1451,50 +1451,40 @@ class SiftMetalFeatureMatcher : public FeatureMatcher {
+       return;
+     }
+ 
+-    const auto& d1 = image1.descriptors->data;
+-    const auto& d2 = image2.descriptors->data;
+-    std::vector<int> best_1to2;
+-    std::vector<float> dot_1to2;
+-    std::vector<float> second_1to2;
+-    if (!gpu_.Top2(static_cast<int>(d1.rows()),
+-                   d1.data(),
+-                   static_cast<int>(d2.rows()),
+-                   d2.data(),
+-                   &best_1to2,
+-                   &dot_1to2,
+-                   &second_1to2)) {
++    sift_metal::Top2Result forward;
++    sift_metal::Top2Result backward;
++    if (!gpu_.Match(DescriptorSetFor(image1),
++                    DescriptorSetFor(image2),
++                    &forward,
++                    options_.sift->cross_check ? &backward : nullptr)) {
+       LOG(ERROR) << "Metal SIFT matching failed";
+       return;
+     }
+ 
+-    std::vector<int> best_2to1;
+-    std::vector<float> dot_2to1;
+-    std::vector<float> second_2to1;
+-    if (options_.sift->cross_check) {
+-      if (!gpu_.Top2(static_cast<int>(d2.rows()),
+-                     d2.data(),
+-                     static_cast<int>(d1.rows()),
+-                     d1.data(),
+-                     &best_2to1,
+-                     &dot_2to1,
+-                     &second_2to1)) {
+-        LOG(ERROR) << "Metal SIFT matching failed";
+-        return;
+-      }
+-    }
+-
+-    FindBestMatchesTop2(best_1to2,
+-                        dot_1to2,
+-                        second_1to2,
+-                        best_2to1,
+-                        dot_2to1,
+-                        second_2to1,
++    FindBestMatchesTop2(forward.best_idx,
++                        forward.best_dot,
++                        forward.second_dot,
++                        backward.best_idx,
++                        backward.best_dot,
++                        backward.second_dot,
+                         static_cast<float>(options_.sift->max_ratio),
+                         static_cast<float>(options_.sift->max_distance),
+                         options_.sift->cross_check,
+                         matches);
+   }
+ 
++  // The image id keys the GPU upload cache; descriptors of an image do not
++  // change while a matcher is alive.
++  static sift_metal::DescriptorSet DescriptorSetFor(const Image& image) {
++    sift_metal::DescriptorSet set;
++    set.key = image.image_id == kInvalidImageId
++                  ? -1
++                  : static_cast<int64_t>(image.image_id);
++    set.rows = static_cast<int>(image.descriptors->data.rows());
++    set.data = image.descriptors->data.data();
++    return set;
++  }
++
+   // Guided matching stays on the CPU verifier's inliers; Metal covers the
+   // exhaustive pair search that dominated runtime.
+   void MatchGuided(const double /*max_error*/,
+diff --git a/src/thirdparty/SiftMetal/SiftMetal.mm b/src/thirdparty/SiftMetal/SiftMetal.mm
+index 779f75f5..7ab211b3 100644
+--- a/src/thirdparty/SiftMetal/SiftMetal.mm
++++ b/src/thirdparty/SiftMetal/SiftMetal.mm
+@@ -1,5 +1,10 @@
+ // SiftMetal.mm - Metal-accelerated SIFT feature extraction.
+ // Objective-C++ port of SIFTMetal Swift library by Luke Van In.
++//
++// GPU/CPU hand-offs per image are kept to four command buffers: the whole
++// scale-space pyramid (all octaves), then interpolation, orientation and
++// descriptors each batched across octaves. Everything the CPU never reads
++// lives in private textures.
+ 
+ #import <Metal/Metal.h>
+ #import <Foundation/Foundation.h>
+@@ -17,11 +22,13 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
++#include <cstring>
+ #include <limits.h>
+ #include <mach-o/dyld.h>
+ #include <numeric>
+ #include <stdlib.h>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ // Path to compiled metallib is set by CMake and embedded here.
+@@ -35,6 +42,15 @@
+ static constexpr int kMaxKeypoints = 4096;
+ static constexpr int kMaxDescriptors = 8192;
+ 
++// Threads per threadgroup for the one-thread-per-keypoint kernels. A single
++// threadgroup runs on one GPU core, so small groups spread a few thousand
++// keypoints across the whole GPU.
++static constexpr NSUInteger kKeypointThreadgroup = 64;
++
++// SiftGPU rejects DoG samples below 0.8 x peak threshold at detection time;
++// the interpolated contrast is checked against the full threshold later.
++static constexpr float kDetectionThresholdScale = 0.8f;
++
+ // ---------------------------------------------------------------------------
+ // Helper: compute 1D Gaussian kernel weights.
+ // ---------------------------------------------------------------------------
+@@ -53,6 +69,20 @@
+   return weights;
+ }
+ 
++// Index of the octave sigma closest to `sigma`.
++static int ClosestScaleIndex(const std::vector<float>& sigmas, float sigma) {
++  int scaleIdx = 0;
++  float bestDiff = 1e30f;
++  for (int s = 0; s < (int)sigmas.size(); ++s) {
++    float diff = std::abs(sigmas[s] - sigma);
++    if (diff < bestDiff) {
++      bestDiff = diff;
++      scaleIdx = s;
++    }
++  }
++  return scaleIdx;
++}
++
+ // ---------------------------------------------------------------------------
+ // Octave: manages textures and pipelines for one octave of the pyramid.
+ // ---------------------------------------------------------------------------
+@@ -63,9 +93,12 @@
+   int num_scales;        // scales per octave (typically 3)
+   std::vector<float> sigmas;  // sigma values for each gaussian
+ 
+-  id<MTLTexture> gaussianTextures;   // 2DArray [num_scales+3]
+-  id<MTLTexture> differenceTextures; // 2DArray [num_scales+2]
+-  id<MTLTexture> gradientTextures;   // 2DArray, rg32Float
++  id<MTLTexture> gaussianTextures;   // 2DArray [num_scales+3], private
++  id<MTLTexture> differenceTextures; // 2DArray [num_scales+2], private
++  id<MTLTexture> gradientTextures;   // 2DArray, rg16Float, private
++
++  // Nearest-neighbour downscale parameters (octaves > 0).
++  id<MTLBuffer> downscaleParamsBuffer;
+ 
+   // Buffers for extrema detection
+   id<MTLBuffer> extremaOutputBuffer;
+@@ -93,6 +126,13 @@
+   };
+   std::vector<ConvPair> convPairs;
+   id<MTLTexture> convWorkTexture; // private storage 2DArray[1]
++
++  // Per-image work state carried between the batched phases.
++  int interpolateCount = 0;
++  int orientationCount = 0;
++  int descriptorCount = 0;
++  std::vector<Keypoint> keypoints;
++  std::vector<std::pair<int, float>> oriented;  // (keypoint index, theta)
+ };
+ 
+ // ---------------------------------------------------------------------------
+@@ -104,12 +144,12 @@
+   bool Extract(const uint8_t* data, int w, int h, ExtractResult* result);
+ 
+  private:
++  void CreateSeedTextures(int w, int h);
+   void SetupOctaves(int w, int h);
+   void SetupOctave(Octave& oct, int o, float delta, int w, int h,
+                    int num_scales, const std::vector<float>& sigmas);
+ 
+-  // Pipeline encoding helpers
+-  void EncodeGrayscaleUpload(id<MTLCommandBuffer> cb, int w, int h);
++  // Phase 1: pyramid encoding helpers
+   void EncodeSeedTexture(id<MTLCommandBuffer> cb);
+   void EncodeOctave(id<MTLCommandBuffer> cb, Octave& oct,
+                     id<MTLTexture> inputTexture, bool inputIs2D);
+@@ -118,16 +158,25 @@ void EncodeOctave(id<MTLCommandBuffer> cb, Octave& oct,
+   void EncodeGradients(id<MTLCommandBuffer> cb, Octave& oct);
+   void EncodeExtrema(id<MTLCommandBuffer> cb, Octave& oct);
+ 
+-  // Per-octave extraction
++  // Phase 2: per-octave CPU preparation and GPU encoding, batched by stage
+   int ReadExtremaCount(Octave& oct);
+-  void InterpolateKeypoints(Octave& oct, int extrema_count);
+-  void ComputeOrientations(Octave& oct,
+-                           const std::vector<Keypoint>& keypoints,
+-                           std::vector<std::pair<int, float>>& oriented);
+-  void ComputeDescriptors(Octave& oct,
+-                          const std::vector<Keypoint>& keypoints,
+-                          const std::vector<std::pair<int, float>>& oriented,
+-                          ExtractResult* result);
++  bool PrepareInterpolation(Octave& oct);
++  void EncodeInterpolation(id<MTLCommandBuffer> cb, Octave& oct);
++  void CollectKeypoints(Octave& oct);
++  bool PrepareOrientations(Octave& oct);
++  void EncodeOrientations(id<MTLCommandBuffer> cb, Octave& oct);
++  void ReadOrientations(Octave& oct);
++  bool PrepareDescriptors(Octave& oct);
++  void EncodeDescriptors(id<MTLCommandBuffer> cb, Octave& oct);
++  void ReadDescriptors(Octave& oct, ExtractResult* result);
++
++  void EncodeKeypointKernel(id<MTLCommandBuffer> cb,
++                            id<MTLComputePipelineState> pipeline,
++                            id<MTLBuffer> output, id<MTLBuffer> input,
++                            id<MTLBuffer> params, id<MTLTexture> texture,
++                            int count);
++
++  void TruncateToMaxFeatures(ExtractResult* result);
+ 
+   // Metal objects
+   id<MTLDevice> device_;
+@@ -149,9 +198,9 @@ void ComputeDescriptors(Octave& oct,
+   id<MTLComputePipelineState> siftDescriptorsPipeline_;
+ 
+   // Seed textures
+-  id<MTLTexture> luminosityTexture_;  // R32Float, input size
+-  id<MTLTexture> scaledTexture_;      // R32Float, seed size (2x)
+-  id<MTLTexture> seedTexture_;        // R32Float, seed size (2x)
++  id<MTLTexture> luminosityTexture_;  // R8Unorm, input size, shared (CPU upload)
++  id<MTLTexture> scaledTexture_;      // R32Float, seed size, private
++  id<MTLTexture> seedTexture_;        // R32Float, seed size, private
+   id<MTLTexture> seedConvWorkTexture_; // R32Float, seed size, private
+ 
+   // Seed Gaussian blur convolution buffers
+@@ -168,9 +217,6 @@ void ComputeDescriptors(Octave& oct,
+   float sigma_input_ = 0.5f;
+   int input_w_ = 0, input_h_ = 0;
+   int seed_w_ = 0, seed_h_ = 0;
+-
+-  // Upload buffer
+-  id<MTLBuffer> uploadBuffer_;
+ };
+ 
+ // ---------------------------------------------------------------------------
+@@ -222,6 +268,20 @@ void ComputeDescriptors(Octave& oct,
+   return [device newTextureWithDescriptor:desc];
+ }
+ 
++static id<MTLBuffer> MakeSharedBuffer(id<MTLDevice> device, size_t length) {
++  return [device newBufferWithLength:length
++                             options:MTLResourceStorageModeShared];
++}
++
++// Grid covering a w x h (x depth) texture with 16x16 threadgroups. Used with
++// dispatchThreads so edge groups are trimmed instead of bounds-checked.
++static void DispatchImage(id<MTLComputeCommandEncoder> enc, int w, int h,
++                          int depth) {
++  MTLSize tg = {16, 16, 1};
++  MTLSize grid = {(NSUInteger)w, (NSUInteger)h, (NSUInteger)depth};
++  [enc dispatchThreads:grid threadsPerThreadgroup:tg];
++}
++
+ // ---------------------------------------------------------------------------
+ // Metallib lookup: sidecar layouts, then the CMake bake path.
+ // ---------------------------------------------------------------------------
+@@ -310,7 +370,10 @@ void ComputeDescriptors(Octave& oct,
+   siftDescriptorsPipeline_ =
+       MakePipeline(device_, library_, "siftDescriptors");
+ 
+-  if (!bilinearUpScalePipeline_ || !subtractPipeline_ ||
++  if (!bilinearUpScalePipeline_ || !nearestNeighborDownScalePipeline_ ||
++      !convolutionXPipeline_ || !convolutionYPipeline_ ||
++      !convolutionSeriesXPipeline_ || !convolutionSeriesYPipeline_ ||
++      !subtractPipeline_ || !siftGradientPipeline_ ||
+       !siftExtremaListPipeline_ || !siftInterpolatePipeline_ ||
+       !siftOrientationPipeline_ || !siftDescriptorsPipeline_) {
+     return false;
+@@ -323,25 +386,6 @@ void ComputeDescriptors(Octave& oct,
+     delta_min_ = 1.0f;
+   }
+ 
+-  input_w_ = max_w;
+-  input_h_ = max_h;
+-  seed_w_ = static_cast<int>(float(max_w) / delta_min_);
+-  seed_h_ = static_cast<int>(float(max_h) / delta_min_);
+-
+-  // Create textures for the seed stage.
+-  luminosityTexture_ = MakeTexture2D(device_, max_w, max_h,
+-                                      MTLPixelFormatR32Float,
+-                                      MTLStorageModeShared);
+-  scaledTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
+-                                  MTLPixelFormatR32Float,
+-                                  MTLStorageModeShared);
+-  seedTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
+-                                MTLPixelFormatR32Float,
+-                                MTLStorageModeShared);
+-  seedConvWorkTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
+-                                        MTLPixelFormatR32Float,
+-                                        MTLStorageModePrivate);
+-
+   // Compute seed Gaussian blur kernel.
+   float sigma_seed = std::sqrt(sigma_min_ * sigma_min_ -
+                                 sigma_input_ * sigma_input_) / delta_min_;
+@@ -356,18 +400,34 @@ void ComputeDescriptors(Octave& oct,
+                            length:sizeof(uint32_t)
+                           options:MTLResourceStorageModeShared];
+ 
+-  // Upload buffer large enough for max image.
+-  size_t maxPixels = (size_t)max_w * max_h;
+-  uploadBuffer_ =
+-      [device_ newBufferWithLength:maxPixels * sizeof(float)
+-                           options:MTLResourceStorageModeShared];
+-
+-  // Setup octaves.
++  CreateSeedTextures(max_w, max_h);
+   SetupOctaves(max_w, max_h);
+ 
+   return true;
+ }
+ 
++// Input-size dependent textures. The luminosity texture is R8Unorm so the
++// uint8 image is uploaded as-is and read back as v/255 by the GPU.
++void SiftMetalExtractorImpl::CreateSeedTextures(int w, int h) {
++  input_w_ = w;
++  input_h_ = h;
++  seed_w_ = static_cast<int>(float(w) / delta_min_);
++  seed_h_ = static_cast<int>(float(h) / delta_min_);
++
++  luminosityTexture_ = MakeTexture2D(device_, w, h,
++                                      MTLPixelFormatR8Unorm,
++                                      MTLStorageModeShared);
++  scaledTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
++                                  MTLPixelFormatR32Float,
++                                  MTLStorageModePrivate);
++  seedTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
++                                MTLPixelFormatR32Float,
++                                MTLStorageModePrivate);
++  seedConvWorkTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
++                                        MTLPixelFormatR32Float,
++                                        MTLStorageModePrivate);
++}
++
+ // ---------------------------------------------------------------------------
+ // SetupOctaves
+ // ---------------------------------------------------------------------------
+@@ -384,6 +444,7 @@ void ComputeDescriptors(Octave& oct,
+     num_octaves = std::max(1, num_octaves);
+   }
+ 
++  octaves_.clear();
+   octaves_.resize(num_octaves);
+   for (int o = 0; o < num_octaves; ++o) {
+     float delta = delta_min_ * std::pow(2.0f, float(o));
+@@ -421,18 +482,29 @@ void ComputeDescriptors(Octave& oct,
+ 
+   oct.gaussianTextures = MakeTexture2DArray(
+       device_, w, h, numGaussians, MTLPixelFormatR32Float,
+-      MTLStorageModeShared);
++      MTLStorageModePrivate);
+   oct.differenceTextures = MakeTexture2DArray(
+       device_, w, h, numDifferences, MTLPixelFormatR32Float,
+-      MTLStorageModeShared);
++      MTLStorageModePrivate);
++  // Angle and magnitude in half precision: 2^-9 rad resolution against
++  // 36 orientation bins of 0.17 rad, and half the bandwidth of RG32Float.
+   oct.gradientTextures = MakeTexture2DArray(
+-      device_, w, h, numGaussians, MTLPixelFormatRG32Float,
+-      MTLStorageModeShared);
++      device_, w, h, numGaussians, MTLPixelFormatRG16Float,
++      MTLStorageModePrivate);
+ 
+   // Convolution work texture (single-slice private).
+   oct.convWorkTexture = MakeTexture2DArray(
+       device_, w, h, 1, MTLPixelFormatR32Float, MTLStorageModePrivate);
+ 
++  // Downscale from the previous octave's gaussian[num_scales] into slice 0.
++  NearestNeighborScaleParameters downscale = {};
++  downscale.inputSlice = num_scales;
++  downscale.outputSlice = 0;
++  oct.downscaleParamsBuffer =
++      [device_ newBufferWithBytes:&downscale
++                           length:sizeof(NearestNeighborScaleParameters)
++                          options:MTLResourceStorageModeShared];
++
+   // Build convolution parameter buffers for Gaussian series.
+   oct.convPairs.resize(numGaussians - 1);
+   for (int s = 1; s < numGaussians; ++s) {
+@@ -440,15 +512,19 @@ void ComputeDescriptors(Octave& oct,
+     float sb = sigmas[s];
+     float rho = std::sqrt(sb * sb - sa * sa) / delta;
+     auto weights = GaussianWeights(rho);
++    if (weights.size() > (size_t)CONVOLUTION_WEIGHTS_LENGTH) {
++      NSLog(@"SiftMetal: Gaussian kernel of %zu taps truncated to %d "
++            @"(octave %d, scale %d); lower scales_per_octave is unsupported",
++            weights.size(), CONVOLUTION_WEIGHTS_LENGTH, o, s);
++    }
++    size_t count = std::min(weights.size(), (size_t)CONVOLUTION_WEIGHTS_LENGTH);
+ 
+     // X pass: read from slice [s-1], write to work slice [0]
+     ConvolutionParameters paramsX = {};
+     paramsX.inputDepth = static_cast<int32_t>(s - 1);
+     paramsX.outputDepth = 0;
+-    paramsX.count = static_cast<int32_t>(weights.size());
+-    std::memcpy(paramsX.weights, weights.data(),
+-                std::min(weights.size(), (size_t)CONVOLUTION_WEIGHTS_LENGTH) *
+-                    sizeof(float));
++    paramsX.count = static_cast<int32_t>(count);
++    std::memcpy(paramsX.weights, weights.data(), count * sizeof(float));
+     oct.convPairs[s - 1].paramsX =
+         [device_ newBufferWithBytes:&paramsX
+                              length:sizeof(ConvolutionParameters)
+@@ -458,10 +534,8 @@ void ComputeDescriptors(Octave& oct,
+     ConvolutionParameters paramsY = {};
+     paramsY.inputDepth = 0;
+     paramsY.outputDepth = static_cast<int32_t>(s);
+-    paramsY.count = static_cast<int32_t>(weights.size());
+-    std::memcpy(paramsY.weights, weights.data(),
+-                std::min(weights.size(), (size_t)CONVOLUTION_WEIGHTS_LENGTH) *
+-                    sizeof(float));
++    paramsY.count = static_cast<int32_t>(count);
++    std::memcpy(paramsY.weights, weights.data(), count * sizeof(float));
+     oct.convPairs[s - 1].paramsY =
+         [device_ newBufferWithBytes:&paramsY
+                              length:sizeof(ConvolutionParameters)
+@@ -470,49 +544,32 @@ void ComputeDescriptors(Octave& oct,
+ 
+   // Extrema buffers
+   oct.extremaOutputBuffer =
+-      [device_ newBufferWithLength:kMaxExtrema * sizeof(SIFTExtremaResult)
+-                           options:MTLResourceStorageModeShared];
+-  oct.extremaIndexBuffer =
+-      [device_ newBufferWithLength:sizeof(int32_t)
+-                           options:MTLResourceStorageModeShared];
++      MakeSharedBuffer(device_, kMaxExtrema * sizeof(SIFTExtremaResult));
++  oct.extremaIndexBuffer = MakeSharedBuffer(device_, sizeof(int32_t));
+ 
+   // Interpolation buffers
+-  oct.interpolateInputBuffer =
+-      [device_ newBufferWithLength:kMaxKeypoints *
+-                                       sizeof(SIFTInterpolateInputKeypoint)
+-                           options:MTLResourceStorageModeShared];
+-  oct.interpolateOutputBuffer =
+-      [device_ newBufferWithLength:kMaxKeypoints *
+-                                       sizeof(SIFTInterpolateOutputKeypoint)
+-                           options:MTLResourceStorageModeShared];
++  oct.interpolateInputBuffer = MakeSharedBuffer(
++      device_, kMaxKeypoints * sizeof(SIFTInterpolateInputKeypoint));
++  oct.interpolateOutputBuffer = MakeSharedBuffer(
++      device_, kMaxKeypoints * sizeof(SIFTInterpolateOutputKeypoint));
+   oct.interpolateParamsBuffer =
+-      [device_ newBufferWithLength:sizeof(SIFTInterpolateParameters)
+-                           options:MTLResourceStorageModeShared];
++      MakeSharedBuffer(device_, sizeof(SIFTInterpolateParameters));
+ 
+   // Orientation buffers
+-  oct.orientationInputBuffer =
+-      [device_ newBufferWithLength:kMaxKeypoints *
+-                                       sizeof(SIFTOrientationKeypoint)
+-                           options:MTLResourceStorageModeShared];
+-  oct.orientationOutputBuffer =
+-      [device_ newBufferWithLength:kMaxKeypoints *
+-                                       sizeof(SIFTOrientationResult)
+-                           options:MTLResourceStorageModeShared];
++  oct.orientationInputBuffer = MakeSharedBuffer(
++      device_, kMaxKeypoints * sizeof(SIFTOrientationKeypoint));
++  oct.orientationOutputBuffer = MakeSharedBuffer(
++      device_, kMaxKeypoints * sizeof(SIFTOrientationResult));
+   oct.orientationParamsBuffer =
+-      [device_ newBufferWithLength:sizeof(SIFTOrientationParameters)
+-                           options:MTLResourceStorageModeShared];
++      MakeSharedBuffer(device_, sizeof(SIFTOrientationParameters));
+ 
+   // Descriptor buffers
+-  oct.descriptorInputBuffer =
+-      [device_ newBufferWithLength:kMaxDescriptors * sizeof(SIFTDescriptorInput)
+-                           options:MTLResourceStorageModeShared];
+-  oct.descriptorOutputBuffer =
+-      [device_ newBufferWithLength:kMaxDescriptors *
+-                                       sizeof(SIFTDescriptorResult)
+-                           options:MTLResourceStorageModeShared];
++  oct.descriptorInputBuffer = MakeSharedBuffer(
++      device_, kMaxDescriptors * sizeof(SIFTDescriptorInput));
++  oct.descriptorOutputBuffer = MakeSharedBuffer(
++      device_, kMaxDescriptors * sizeof(SIFTDescriptorResult));
+   oct.descriptorParamsBuffer =
+-      [device_ newBufferWithLength:sizeof(SIFTDescriptorParameters)
+-                           options:MTLResourceStorageModeShared];
++      MakeSharedBuffer(device_, sizeof(SIFTDescriptorParameters));
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -525,45 +582,18 @@ void ComputeDescriptors(Octave& oct,
+ 
+   // Recreate textures if image size changed.
+   if (w != input_w_ || h != input_h_) {
+-    input_w_ = w;
+-    input_h_ = h;
+-    seed_w_ = static_cast<int>(float(w) / delta_min_);
+-    seed_h_ = static_cast<int>(float(h) / delta_min_);
+-
+-    luminosityTexture_ = MakeTexture2D(device_, w, h,
+-                                        MTLPixelFormatR32Float,
+-                                        MTLStorageModeShared);
+-    scaledTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
+-                                    MTLPixelFormatR32Float,
+-                                    MTLStorageModeShared);
+-    seedTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
+-                                  MTLPixelFormatR32Float,
+-                                  MTLStorageModeShared);
+-    seedConvWorkTexture_ = MakeTexture2D(device_, seed_w_, seed_h_,
+-                                          MTLPixelFormatR32Float,
+-                                          MTLStorageModePrivate);
+-
+-    size_t maxPixels = (size_t)w * h;
+-    if (uploadBuffer_.length < maxPixels * sizeof(float)) {
+-      uploadBuffer_ =
+-          [device_ newBufferWithLength:maxPixels * sizeof(float)
+-                               options:MTLResourceStorageModeShared];
+-    }
+-
++    CreateSeedTextures(w, h);
+     SetupOctaves(w, h);
+   }
+-
+-  // Convert uint8 grayscale to float and upload to luminosity texture.
+-  float* uploadPtr = static_cast<float*>(uploadBuffer_.contents);
+-  size_t npixels = (size_t)w * h;
+-  for (size_t i = 0; i < npixels; ++i) {
+-    uploadPtr[i] = static_cast<float>(data[i]) / 255.0f;
++  if (octaves_.empty()) {
++    return true;  // image too small for a single octave
+   }
+-  MTLRegion region = MTLRegionMake2D(0, 0, w, h);
+-  [luminosityTexture_ replaceRegion:region
++
++  // Upload the uint8 grayscale image; the R8Unorm texture yields v/255.
++  [luminosityTexture_ replaceRegion:MTLRegionMake2D(0, 0, w, h)
+                         mipmapLevel:0
+-                          withBytes:uploadPtr
+-                        bytesPerRow:w * sizeof(float)];
++                          withBytes:data
++                        bytesPerRow:w];
+ 
+   // Phase 1: Build scale-space pyramid (DoG + gradients + extrema).
+   {
+@@ -583,99 +613,111 @@ void ComputeDescriptors(Octave& oct,
+     [cb waitUntilCompleted];
+   }
+ 
+-  // Phase 2: For each octave, read extrema, interpolate, orientate, describe.
+-  for (auto& oct : octaves_) {
+-    int extremaCount = ReadExtremaCount(oct);
+-    if (extremaCount <= 0) continue;
+-    extremaCount = std::min(extremaCount, kMaxExtrema);
+-
+-    InterpolateKeypoints(oct, extremaCount);
+-
+-    // Read interpolated keypoints.
+-    auto* interpOut = static_cast<SIFTInterpolateOutputKeypoint*>(
+-        oct.interpolateOutputBuffer.contents);
+-    float sigmaRatio = oct.sigmas[1] / oct.sigmas[0];
+-
+-    std::vector<Keypoint> octKeypoints;
+-    for (int k = 0; k < extremaCount; ++k) {
+-      auto& p = interpOut[k];
+-      if (!p.converged) continue;
+-
+-      Keypoint kp;
+-      kp.x = p.absoluteX;
+-      kp.y = p.absoluteY;
+-      kp.sigma = oct.sigmas[p.scale] * std::pow(sigmaRatio, p.subScale);
+-      kp.orientation = 0; // Will be set during orientation pass.
+-      octKeypoints.push_back(kp);
++  // Phase 2a: interpolate all octaves' extrema in one command buffer.
++  {
++    id<MTLCommandBuffer> cb = [commandQueue_ commandBuffer];
++    bool encoded = false;
++    for (auto& oct : octaves_) {
++      if (PrepareInterpolation(oct)) {
++        EncodeInterpolation(cb, oct);
++        encoded = true;
++      }
+     }
++    if (encoded) {
++      [cb commit];
++      [cb waitUntilCompleted];
++    }
++  }
+ 
+-    if (octKeypoints.empty()) continue;
+-
+-    // Compute orientations.
+-    std::vector<std::pair<int, float>> oriented; // (keypoint_index, theta)
+-    ComputeOrientations(oct, octKeypoints, oriented);
+-
+-    if (oriented.empty()) continue;
+-
+-    // Compute descriptors.
+-    ComputeDescriptors(oct, octKeypoints, oriented, result);
++  // Phase 2b: orientations for all octaves.
++  {
++    id<MTLCommandBuffer> cb = [commandQueue_ commandBuffer];
++    bool encoded = false;
++    for (auto& oct : octaves_) {
++      CollectKeypoints(oct);
++      if (PrepareOrientations(oct)) {
++        EncodeOrientations(cb, oct);
++        encoded = true;
++      }
++    }
++    if (encoded) {
++      [cb commit];
++      [cb waitUntilCompleted];
++    }
+   }
+ 
+-  // Sort by scale (descending) and truncate to max_num_features.
+-  if (options_.max_num_features > 0 &&
+-      (int)result->keypoints.size() > options_.max_num_features) {
+-    // Create index array, sort by sigma descending.
+-    std::vector<int> indices(result->keypoints.size());
+-    std::iota(indices.begin(), indices.end(), 0);
+-    std::sort(indices.begin(), indices.end(),
+-              [&](int a, int b) {
+-                return result->keypoints[a].sigma >
+-                       result->keypoints[b].sigma;
+-              });
+-    indices.resize(options_.max_num_features);
+-    std::sort(indices.begin(), indices.end()); // Restore order.
+-
+-    std::vector<Keypoint> newKp;
+-    std::vector<float> newDesc;
+-    newKp.reserve(options_.max_num_features);
+-    newDesc.reserve(options_.max_num_features * 128);
+-    for (int idx : indices) {
+-      newKp.push_back(result->keypoints[idx]);
+-      newDesc.insert(newDesc.end(),
+-                     result->descriptors.begin() + idx * 128,
+-                     result->descriptors.begin() + (idx + 1) * 128);
++  // Phase 2c: descriptors for all octaves.
++  {
++    id<MTLCommandBuffer> cb = [commandQueue_ commandBuffer];
++    bool encoded = false;
++    for (auto& oct : octaves_) {
++      ReadOrientations(oct);
++      if (PrepareDescriptors(oct)) {
++        EncodeDescriptors(cb, oct);
++        encoded = true;
++      }
++    }
++    if (encoded) {
++      [cb commit];
++      [cb waitUntilCompleted];
+     }
+-    result->keypoints = std::move(newKp);
+-    result->descriptors = std::move(newDesc);
+   }
+ 
++  for (auto& oct : octaves_) {
++    ReadDescriptors(oct, result);
++  }
++
++  TruncateToMaxFeatures(result);
+   return true;
+ }
+ 
++// Keep the max_num_features largest-scale features, preserving order.
++void SiftMetalExtractorImpl::TruncateToMaxFeatures(ExtractResult* result) {
++  if (options_.max_num_features <= 0 ||
++      (int)result->keypoints.size() <= options_.max_num_features) {
++    return;
++  }
++
++  std::vector<int> indices(result->keypoints.size());
++  std::iota(indices.begin(), indices.end(), 0);
++  std::sort(indices.begin(), indices.end(),
++            [&](int a, int b) {
++              return result->keypoints[a].sigma >
++                     result->keypoints[b].sigma;
++            });
++  indices.resize(options_.max_num_features);
++  std::sort(indices.begin(), indices.end()); // Restore order.
++
++  std::vector<Keypoint> newKp;
++  std::vector<float> newDesc;
++  newKp.reserve(options_.max_num_features);
++  newDesc.reserve(options_.max_num_features * 128);
++  for (int idx : indices) {
++    newKp.push_back(result->keypoints[idx]);
++    newDesc.insert(newDesc.end(),
++                   result->descriptors.begin() + idx * 128,
++                   result->descriptors.begin() + (idx + 1) * 128);
++  }
++  result->keypoints = std::move(newKp);
++  result->descriptors = std::move(newDesc);
++}
++
+ // ---------------------------------------------------------------------------
+ // EncodeSeedTexture: upscale grayscale input + Gaussian blur.
+ // ---------------------------------------------------------------------------
+ void SiftMetalExtractorImpl::EncodeSeedTexture(id<MTLCommandBuffer> cb) {
+-  // Bilinear upscale luminosity → scaled.
+-  if (seed_w_ != input_w_ || seed_h_ != input_h_) {
++  // Bilinear upscale luminosity -> scaled. At equal size the kernel is an
++  // exact copy, which also converts R8Unorm to R32Float.
++  {
+     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+     [enc setComputePipelineState:bilinearUpScalePipeline_];
+     [enc setTexture:scaledTexture_ atIndex:0];
+     [enc setTexture:luminosityTexture_ atIndex:1];
+-    MTLSize tg = {16, 16, 1};
+-    MTLSize grid = {
+-        (NSUInteger)(seed_w_ + 15) / 16,
+-        (NSUInteger)(seed_h_ + 15) / 16, 1};
+-    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
++    DispatchImage(enc, seed_w_, seed_h_, 1);
+     [enc endEncoding];
+-  } else {
+-    // Same size: just copy.
+-    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+-    [blit copyFromTexture:luminosityTexture_ toTexture:scaledTexture_];
+-    [blit endEncoding];
+   }
+ 
+-  // Gaussian blur scaled → seed (separable 1D convolution).
++  // Gaussian blur scaled -> seed (separable 1D convolution).
+   {
+     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+     [enc setComputePipelineState:convolutionXPipeline_];
+@@ -683,10 +725,7 @@ void ComputeDescriptors(Octave& oct,
+     [enc setTexture:scaledTexture_ atIndex:1];
+     [enc setBuffer:seedConvWeightsBuffer_ offset:0 atIndex:0];
+     [enc setBuffer:seedConvParamsBuffer_ offset:0 atIndex:1];
+-    MTLSize tg = {16, 16, 1};
+-    MTLSize grid = {(NSUInteger)(seed_w_ + 15) / 16,
+-                    (NSUInteger)(seed_h_ + 15) / 16, 1};
+-    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
++    DispatchImage(enc, seed_w_, seed_h_, 1);
+     [enc endEncoding];
+   }
+   {
+@@ -696,10 +735,7 @@ void ComputeDescriptors(Octave& oct,
+     [enc setTexture:seedConvWorkTexture_ atIndex:1];
+     [enc setBuffer:seedConvWeightsBuffer_ offset:0 atIndex:0];
+     [enc setBuffer:seedConvParamsBuffer_ offset:0 atIndex:1];
+-    MTLSize tg = {16, 16, 1};
+-    MTLSize grid = {(NSUInteger)(seed_w_ + 15) / 16,
+-                    (NSUInteger)(seed_h_ + 15) / 16, 1};
+-    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
++    DispatchImage(enc, seed_w_, seed_h_, 1);
+     [enc endEncoding];
+   }
+ }
+@@ -716,7 +752,7 @@ void ComputeDescriptors(Octave& oct,
+ 
+   // Copy/scale input into gaussian slice 0.
+   if (inputIs2D) {
+-    // 2D texture → first slice of 2DArray.
++    // 2D texture -> first slice of 2DArray.
+     if ((int)inputTexture.width == w && (int)inputTexture.height == h) {
+       id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+       [blit copyFromTexture:inputTexture
+@@ -732,35 +768,18 @@ void ComputeDescriptors(Octave& oct,
+     }
+   } else {
+     // Nearest-neighbor downscale from previous octave's gaussian[num_scales].
+-    auto* params = static_cast<NearestNeighborScaleParameters*>(
+-        [device_ newBufferWithLength:sizeof(NearestNeighborScaleParameters)
+-                             options:MTLResourceStorageModeShared].contents);
+-    id<MTLBuffer> paramsBuf =
+-        [device_ newBufferWithLength:sizeof(NearestNeighborScaleParameters)
+-                             options:MTLResourceStorageModeShared];
+-    auto* p = static_cast<NearestNeighborScaleParameters*>(paramsBuf.contents);
+-    p->inputSlice = oct.num_scales;
+-    p->outputSlice = 0;
+-
+     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+     [enc setComputePipelineState:nearestNeighborDownScalePipeline_];
+     [enc setTexture:oct.gaussianTextures atIndex:0];
+     [enc setTexture:inputTexture atIndex:1];
+-    [enc setBuffer:paramsBuf offset:0 atIndex:0];
+-    MTLSize tg = {16, 16, 1};
+-    MTLSize grid = {(NSUInteger)(w + 15) / 16,
+-                    (NSUInteger)(h + 15) / 16, 1};
+-    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
++    [enc setBuffer:oct.downscaleParamsBuffer offset:0 atIndex:0];
++    DispatchImage(enc, w, h, 1);
+     [enc endEncoding];
+   }
+ 
+-  // Gaussian series blur.
+   EncodeGaussianSeries(cb, oct);
+-  // Differences.
+   EncodeDifferences(cb, oct);
+-  // Gradients.
+   EncodeGradients(cb, oct);
+-  // Extrema detection.
+   EncodeExtrema(cb, oct);
+ }
+ 
+@@ -768,29 +787,26 @@ void ComputeDescriptors(Octave& oct,
+                                                     Octave& oct) {
+   int w = oct.width;
+   int h = oct.height;
+-  MTLSize tg = {16, 16, 1};
+-  MTLSize grid = {(NSUInteger)(w + 15) / 16,
+-                  (NSUInteger)(h + 15) / 16, 1};
+ 
+   for (auto& pair : oct.convPairs) {
+-    // X pass: gaussian → work
++    // X pass: gaussian -> work
+     {
+       id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+       [enc setComputePipelineState:convolutionSeriesXPipeline_];
+       [enc setTexture:oct.convWorkTexture atIndex:0];
+       [enc setTexture:oct.gaussianTextures atIndex:1];
+       [enc setBuffer:pair.paramsX offset:0 atIndex:0];
+-      [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
++      DispatchImage(enc, w, h, 1);
+       [enc endEncoding];
+     }
+-    // Y pass: work → gaussian
++    // Y pass: work -> gaussian
+     {
+       id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+       [enc setComputePipelineState:convolutionSeriesYPipeline_];
+       [enc setTexture:oct.gaussianTextures atIndex:0];
+       [enc setTexture:oct.convWorkTexture atIndex:1];
+       [enc setBuffer:pair.paramsY offset:0 atIndex:0];
+-      [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
++      DispatchImage(enc, w, h, 1);
+       [enc endEncoding];
+     }
+   }
+@@ -798,37 +814,21 @@ void ComputeDescriptors(Octave& oct,
+ 
+ void SiftMetalExtractorImpl::EncodeDifferences(id<MTLCommandBuffer> cb,
+                                                  Octave& oct) {
+-  int w = oct.width;
+-  int h = oct.height;
+-  int numDiff = oct.num_scales + 2;
+-
+   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   [enc setComputePipelineState:subtractPipeline_];
+   [enc setTexture:oct.differenceTextures atIndex:0];
+   [enc setTexture:oct.gaussianTextures atIndex:1];
+-  MTLSize tg = {8, 8, 8};
+-  MTLSize grid = {(NSUInteger)(w + 7) / 8,
+-                  (NSUInteger)(h + 7) / 8,
+-                  (NSUInteger)(numDiff + 7) / 8};
+-  [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
++  DispatchImage(enc, oct.width, oct.height, oct.num_scales + 2);
+   [enc endEncoding];
+ }
+ 
+ void SiftMetalExtractorImpl::EncodeGradients(id<MTLCommandBuffer> cb,
+                                                Octave& oct) {
+-  int w = oct.width;
+-  int h = oct.height;
+-  int arrayLen = oct.num_scales + 3;
+-
+   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   [enc setComputePipelineState:siftGradientPipeline_];
+   [enc setTexture:oct.gradientTextures atIndex:0];
+   [enc setTexture:oct.gaussianTextures atIndex:1];
+-  MTLSize tg = {8, 8, 8};
+-  MTLSize grid = {(NSUInteger)(w + 7) / 8,
+-                  (NSUInteger)(h + 7) / 8,
+-                  (NSUInteger)(arrayLen + 7) / 8};
+-  [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
++  DispatchImage(enc, oct.width, oct.height, oct.num_scales + 3);
+   [enc endEncoding];
+ }
+ 
+@@ -842,51 +842,68 @@ void ComputeDescriptors(Octave& oct,
+   auto* idx = static_cast<int32_t*>(oct.extremaIndexBuffer.contents);
+   *idx = 0;
+ 
++  SIFTExtremaParameters params = {};
++  params.threshold = kDetectionThresholdScale * options_.peak_threshold;
++  params.maxResults = static_cast<uint32_t>(kMaxExtrema);
++
+   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   [enc setComputePipelineState:siftExtremaListPipeline_];
+   [enc setBuffer:oct.extremaOutputBuffer offset:0 atIndex:0];
+   [enc setBuffer:oct.extremaIndexBuffer offset:0 atIndex:1];
++  [enc setBytes:&params length:sizeof(params) atIndex:2];
+   [enc setTexture:oct.differenceTextures atIndex:0];
+-
+-  NSUInteger maxThreads = siftExtremaListPipeline_.maxTotalThreadsPerThreadgroup;
+-  NSUInteger dim = (NSUInteger)std::cbrt((double)maxThreads);
+-  MTLSize tg = {dim, dim, dim};
+-  MTLSize gridSize = {(NSUInteger)(w - 2),
+-                      (NSUInteger)(h - 2),
+-                      (NSUInteger)(numDiff - 2)};
+-  [enc dispatchThreads:gridSize threadsPerThreadgroup:tg];
++  DispatchImage(enc, w - 2, h - 2, numDiff - 2);
+   [enc endEncoding];
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// ReadExtremaCount
++// Phase 2 helpers
+ // ---------------------------------------------------------------------------
+ int SiftMetalExtractorImpl::ReadExtremaCount(Octave& oct) {
+   auto* idx = static_cast<int32_t*>(oct.extremaIndexBuffer.contents);
+   int count = static_cast<int>(*idx);
+   *idx = 0;
+-  return count;
++  return std::min(count, kMaxExtrema);
+ }
+ 
+-// ---------------------------------------------------------------------------
+-// InterpolateKeypoints
+-// ---------------------------------------------------------------------------
+-void SiftMetalExtractorImpl::InterpolateKeypoints(Octave& oct,
+-                                                    int extremaCount) {
+-  int count = std::min(extremaCount, kMaxKeypoints);
++void SiftMetalExtractorImpl::EncodeKeypointKernel(
++    id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pipeline,
++    id<MTLBuffer> output, id<MTLBuffer> input, id<MTLBuffer> params,
++    id<MTLTexture> texture, int count) {
++  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++  [enc setComputePipelineState:pipeline];
++  [enc setBuffer:output offset:0 atIndex:0];
++  [enc setBuffer:input offset:0 atIndex:1];
++  [enc setBuffer:params offset:0 atIndex:2];
++  [enc setTexture:texture atIndex:0];
++  NSUInteger tgSize =
++      std::min(kKeypointThreadgroup, pipeline.maxTotalThreadsPerThreadgroup);
++  MTLSize tg = {tgSize, 1, 1};
++  MTLSize grid = {(NSUInteger)count, 1, 1};
++  [enc dispatchThreads:grid threadsPerThreadgroup:tg];
++  [enc endEncoding];
++}
++
++// Copies the octave's extrema into the interpolation input. Returns false
++// when there is nothing to interpolate.
++bool SiftMetalExtractorImpl::PrepareInterpolation(Octave& oct) {
++  oct.interpolateCount = std::min(ReadExtremaCount(oct), kMaxKeypoints);
++  oct.keypoints.clear();
++  oct.oriented.clear();
++  oct.orientationCount = 0;
++  oct.descriptorCount = 0;
++  if (oct.interpolateCount <= 0) return false;
+ 
+-  // Copy extrema to interpolation input buffer.
+   auto* extrema =
+       static_cast<SIFTExtremaResult*>(oct.extremaOutputBuffer.contents);
+   auto* interpIn = static_cast<SIFTInterpolateInputKeypoint*>(
+       oct.interpolateInputBuffer.contents);
+-  for (int i = 0; i < count; ++i) {
++  for (int i = 0; i < oct.interpolateCount; ++i) {
+     interpIn[i].x = extrema[i].x;
+     interpIn[i].y = extrema[i].y;
+     interpIn[i].scale = extrema[i].scale;
+   }
+ 
+-  // Set interpolation parameters.
+   auto* params = static_cast<SIFTInterpolateParameters*>(
+       oct.interpolateParamsBuffer.contents);
+   params->dogThreshold = options_.peak_threshold;
+@@ -897,33 +914,49 @@ void ComputeDescriptors(Octave& oct,
+   params->octaveDelta = oct.delta;
+   params->edgeThreshold = options_.edge_threshold;
+   params->numberOfScales = static_cast<int32_t>(oct.num_scales);
++  return true;
++}
+ 
+-  id<MTLCommandBuffer> cb = [commandQueue_ commandBuffer];
+-  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+-  [enc setComputePipelineState:siftInterpolatePipeline_];
+-  [enc setBuffer:oct.interpolateOutputBuffer offset:0 atIndex:0];
+-  [enc setBuffer:oct.interpolateInputBuffer offset:0 atIndex:1];
+-  [enc setBuffer:oct.interpolateParamsBuffer offset:0 atIndex:2];
+-  [enc setTexture:oct.differenceTextures atIndex:0];
++void SiftMetalExtractorImpl::EncodeInterpolation(id<MTLCommandBuffer> cb,
++                                                  Octave& oct) {
++  EncodeKeypointKernel(cb, siftInterpolatePipeline_,
++                       oct.interpolateOutputBuffer, oct.interpolateInputBuffer,
++                       oct.interpolateParamsBuffer, oct.differenceTextures,
++                       oct.interpolateCount);
++}
+ 
+-  NSUInteger maxThreads =
+-      siftInterpolatePipeline_.maxTotalThreadsPerThreadgroup;
+-  MTLSize tg = {maxThreads, 1, 1};
+-  MTLSize gridSize = {(NSUInteger)count, 1, 1};
+-  [enc dispatchThreads:gridSize threadsPerThreadgroup:tg];
+-  [enc endEncoding];
++// Converged interpolation results become keypoints, sorted by scale so that
++// SIMD groups in the orientation/descriptor kernels see similar window radii.
++void SiftMetalExtractorImpl::CollectKeypoints(Octave& oct) {
++  oct.keypoints.clear();
++  if (oct.interpolateCount <= 0) return;
++
++  auto* interpOut = static_cast<SIFTInterpolateOutputKeypoint*>(
++      oct.interpolateOutputBuffer.contents);
++  float sigmaRatio = oct.sigmas[1] / oct.sigmas[0];
++
++  for (int k = 0; k < oct.interpolateCount; ++k) {
++    auto& p = interpOut[k];
++    if (!p.converged) continue;
++
++    Keypoint kp;
++    kp.x = p.absoluteX;
++    kp.y = p.absoluteY;
++    kp.sigma = oct.sigmas[p.scale] * std::pow(sigmaRatio, p.subScale);
++    kp.orientation = 0; // Will be set during orientation pass.
++    oct.keypoints.push_back(kp);
++  }
+ 
+-  [cb commit];
+-  [cb waitUntilCompleted];
++  std::stable_sort(oct.keypoints.begin(), oct.keypoints.end(),
++                   [](const Keypoint& a, const Keypoint& b) {
++                     return a.sigma < b.sigma;
++                   });
+ }
+ 
+-// ---------------------------------------------------------------------------
+-// ComputeOrientations
+-// ---------------------------------------------------------------------------
+-void SiftMetalExtractorImpl::ComputeOrientations(
+-    Octave& oct, const std::vector<Keypoint>& keypoints,
+-    std::vector<std::pair<int, float>>& oriented) {
+-  oriented.clear();
++// Fills the orientation input with keypoints whose window fits the octave.
++bool SiftMetalExtractorImpl::PrepareOrientations(Octave& oct) {
++  oct.orientationCount = 0;
++  if (oct.keypoints.empty()) return false;
+ 
+   float delta = oct.delta;
+   float lambda = 1.5f;
+@@ -942,9 +975,8 @@ void ComputeDescriptors(Octave& oct,
+       oct.orientationInputBuffer.contents);
+ 
+   int validCount = 0;
+-  std::vector<int> validIndices;
+-  for (int k = 0; k < (int)keypoints.size() && validCount < kMaxKeypoints; ++k) {
+-    const auto& kp = keypoints[k];
++  for (int k = 0; k < (int)oct.keypoints.size() && validCount < kMaxKeypoints; ++k) {
++    const auto& kp = oct.keypoints[k];
+     float x = kp.x / delta;
+     float y = kp.y / delta;
+     float sigma = kp.sigma / delta;
+@@ -955,72 +987,49 @@ void ComputeDescriptors(Octave& oct,
+       continue;
+     }
+ 
+-    // Determine the scale index by finding the closest sigma.
+-    int scaleIdx = 0;
+-    float bestDiff = 1e30f;
+-    for (int s = 0; s < (int)oct.sigmas.size(); ++s) {
+-      float diff = std::abs(oct.sigmas[s] - kp.sigma);
+-      if (diff < bestDiff) {
+-        bestDiff = diff;
+-        scaleIdx = s;
+-      }
+-    }
+-
+     orientIn[validCount].index = static_cast<int32_t>(k);
+     orientIn[validCount].absoluteX = static_cast<int32_t>(kp.x);
+     orientIn[validCount].absoluteY = static_cast<int32_t>(kp.y);
+-    orientIn[validCount].scale = static_cast<int32_t>(scaleIdx);
++    orientIn[validCount].scale =
++        static_cast<int32_t>(ClosestScaleIndex(oct.sigmas, kp.sigma));
+     orientIn[validCount].sigma = kp.sigma;
+-    validIndices.push_back(k);
+     ++validCount;
+   }
+ 
+-  if (validCount == 0) return;
+-
+-  id<MTLCommandBuffer> cb = [commandQueue_ commandBuffer];
+-  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+-  [enc setComputePipelineState:siftOrientationPipeline_];
+-  [enc setBuffer:oct.orientationOutputBuffer offset:0 atIndex:0];
+-  [enc setBuffer:oct.orientationInputBuffer offset:0 atIndex:1];
+-  [enc setBuffer:oct.orientationParamsBuffer offset:0 atIndex:2];
+-  [enc setTexture:oct.gradientTextures atIndex:0];
++  oct.orientationCount = validCount;
++  return validCount > 0;
++}
+ 
+-  NSUInteger maxThreads =
+-      siftOrientationPipeline_.maxTotalThreadsPerThreadgroup;
+-  MTLSize tg = {maxThreads, 1, 1};
+-  MTLSize gridSize = {(NSUInteger)validCount, 1, 1};
+-  [enc dispatchThreads:gridSize threadsPerThreadgroup:tg];
+-  [enc endEncoding];
++void SiftMetalExtractorImpl::EncodeOrientations(id<MTLCommandBuffer> cb,
++                                                 Octave& oct) {
++  EncodeKeypointKernel(cb, siftOrientationPipeline_,
++                       oct.orientationOutputBuffer, oct.orientationInputBuffer,
++                       oct.orientationParamsBuffer, oct.gradientTextures,
++                       oct.orientationCount);
++}
+ 
+-  [cb commit];
+-  [cb waitUntilCompleted];
++void SiftMetalExtractorImpl::ReadOrientations(Octave& oct) {
++  oct.oriented.clear();
++  if (oct.orientationCount <= 0) return;
+ 
+-  // Read orientation results.
+   auto* orientOut = static_cast<SIFTOrientationResult*>(
+       oct.orientationOutputBuffer.contents);
+-  for (int k = 0; k < validCount; ++k) {
++  int maxOrient = options_.upright ? 1 : options_.max_num_orientations;
++  for (int k = 0; k < oct.orientationCount; ++k) {
+     auto& res = orientOut[k];
+     int kpIdx = static_cast<int>(res.keypoint);
+-    int count = static_cast<int>(res.count);
+-    int maxOrient = options_.upright ? 1 : options_.max_num_orientations;
+-    count = std::min(count, maxOrient);
++    int count = std::min(static_cast<int>(res.count), maxOrient);
+     float* oris = reinterpret_cast<float*>(&res.orientations);
+     for (int i = 0; i < count; ++i) {
+       float theta = options_.upright ? 0.0f : oris[i];
+-      oriented.emplace_back(kpIdx, theta);
++      oct.oriented.emplace_back(kpIdx, theta);
+     }
+   }
+ }
+ 
+-// ---------------------------------------------------------------------------
+-// ComputeDescriptors
+-// ---------------------------------------------------------------------------
+-void SiftMetalExtractorImpl::ComputeDescriptors(
+-    Octave& oct, const std::vector<Keypoint>& keypoints,
+-    const std::vector<std::pair<int, float>>& oriented,
+-    ExtractResult* result) {
+-  int count = std::min((int)oriented.size(), kMaxDescriptors);
+-  if (count == 0) return;
++bool SiftMetalExtractorImpl::PrepareDescriptors(Octave& oct) {
++  oct.descriptorCount = std::min((int)oct.oriented.size(), kMaxDescriptors);
++  if (oct.descriptorCount == 0) return false;
+ 
+   auto* params =
+       static_cast<SIFTDescriptorParameters*>(oct.descriptorParamsBuffer.contents);
+@@ -1029,27 +1038,18 @@ void ComputeDescriptors(Octave& oct,
+   params->width = static_cast<int32_t>(oct.width);
+   params->height = static_cast<int32_t>(oct.height);
+ 
++  float sigmaRatio = oct.sigmas[1] / oct.sigmas[0];
++  float logSigmaRatio = std::log(sigmaRatio);
++
+   auto* descIn =
+       static_cast<SIFTDescriptorInput*>(oct.descriptorInputBuffer.contents);
+-  for (int i = 0; i < count; ++i) {
+-    int kpIdx = oriented[i].first;
+-    float theta = oriented[i].second;
+-    const auto& kp = keypoints[kpIdx];
+-
+-    // Determine scale index.
+-    int scaleIdx = 0;
+-    float bestDiff = 1e30f;
+-    for (int s = 0; s < (int)oct.sigmas.size(); ++s) {
+-      float diff = std::abs(oct.sigmas[s] - kp.sigma);
+-      if (diff < bestDiff) {
+-        bestDiff = diff;
+-        scaleIdx = s;
+-      }
+-    }
+-    // Compute subScale.
+-    float sigmaRatio = oct.sigmas[1] / oct.sigmas[0];
+-    float subScale = std::log(kp.sigma / oct.sigmas[scaleIdx]) /
+-                     std::log(sigmaRatio);
++  for (int i = 0; i < oct.descriptorCount; ++i) {
++    int kpIdx = oct.oriented[i].first;
++    float theta = oct.oriented[i].second;
++    const auto& kp = oct.keypoints[kpIdx];
++
++    int scaleIdx = ClosestScaleIndex(oct.sigmas, kp.sigma);
++    float subScale = std::log(kp.sigma / oct.sigmas[scaleIdx]) / logSigmaRatio;
+ 
+     descIn[i].keypoint = static_cast<int32_t>(kpIdx);
+     descIn[i].absoluteX = static_cast<int32_t>(kp.x);
+@@ -1058,34 +1058,32 @@ void ComputeDescriptors(Octave& oct,
+     descIn[i].subScale = subScale;
+     descIn[i].theta = theta;
+   }
++  return true;
++}
+ 
+-  id<MTLCommandBuffer> cb = [commandQueue_ commandBuffer];
+-  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+-  [enc setComputePipelineState:siftDescriptorsPipeline_];
+-  [enc setBuffer:oct.descriptorOutputBuffer offset:0 atIndex:0];
+-  [enc setBuffer:oct.descriptorInputBuffer offset:0 atIndex:1];
+-  [enc setBuffer:oct.descriptorParamsBuffer offset:0 atIndex:2];
+-  [enc setTexture:oct.gradientTextures atIndex:0];
+-
+-  NSUInteger maxThreads =
+-      siftDescriptorsPipeline_.maxTotalThreadsPerThreadgroup;
+-  MTLSize tg = {maxThreads, 1, 1};
+-  MTLSize gridSize = {(NSUInteger)count, 1, 1};
+-  [enc dispatchThreads:gridSize threadsPerThreadgroup:tg];
+-  [enc endEncoding];
++void SiftMetalExtractorImpl::EncodeDescriptors(id<MTLCommandBuffer> cb,
++                                                Octave& oct) {
++  EncodeKeypointKernel(cb, siftDescriptorsPipeline_,
++                       oct.descriptorOutputBuffer, oct.descriptorInputBuffer,
++                       oct.descriptorParamsBuffer, oct.gradientTextures,
++                       oct.descriptorCount);
++}
+ 
+-  [cb commit];
+-  [cb waitUntilCompleted];
++void SiftMetalExtractorImpl::ReadDescriptors(Octave& oct,
++                                              ExtractResult* result) {
++  if (oct.descriptorCount <= 0) return;
+ 
+-  // Read descriptors.
+   auto* descOut = static_cast<SIFTDescriptorResult*>(
+       oct.descriptorOutputBuffer.contents);
+-  for (int i = 0; i < count; ++i) {
++  result->keypoints.reserve(result->keypoints.size() + oct.descriptorCount);
++  result->descriptors.reserve(result->descriptors.size() +
++                              oct.descriptorCount * 128);
++  for (int i = 0; i < oct.descriptorCount; ++i) {
+     auto& dr = descOut[i];
+     if (!dr.valid) continue;
+ 
+-    int kpIdx = oriented[i].first;
+-    const auto& kp = keypoints[kpIdx];
++    int kpIdx = oct.oriented[i].first;
++    const auto& kp = oct.keypoints[kpIdx];
+ 
+     Keypoint finalKp;
+     finalKp.x = kp.x;
+diff --git a/src/thirdparty/SiftMetal/SiftMetalMatch.h b/src/thirdparty/SiftMetal/SiftMetalMatch.h
+index f3bd03f0..6ff67b8f 100644
+--- a/src/thirdparty/SiftMetal/SiftMetalMatch.h
++++ b/src/thirdparty/SiftMetal/SiftMetalMatch.h
+@@ -9,6 +9,23 @@ namespace sift_metal {
+ 
+ class SiftMetalMatcherImpl;
+ 
++// Row-major rows x 128 uint8 descriptors. `key` identifies the set across
++// calls so the GPU upload can be reused (COLMAP image id); negative keys are
++// uploaded every time.
++struct DescriptorSet {
++  int64_t key = -1;
++  int rows = 0;
++  const uint8_t* data = nullptr;
++};
++
++// Per-query best and second-best dot products against the other set.
++// `best_idx` is -1 when no candidate scored above zero.
++struct Top2Result {
++  std::vector<int> best_idx;
++  std::vector<float> best_dot;
++  std::vector<float> second_dot;
++};
++
+ class SiftMetalMatcher {
+  public:
+   SiftMetalMatcher();
+@@ -20,14 +37,12 @@ class SiftMetalMatcher {
+   // Loads sift.metallib and the match kernel. False if Metal is unavailable.
+   bool Init();
+ 
+-  // One-way top-2 dots. `queries`/`index` are row-major n×128 / m×128 uint8.
+-  bool Top2(int num_queries,
+-            const uint8_t* queries,
+-            int num_index,
+-            const uint8_t* index,
+-            std::vector<int>* best_idx,
+-            std::vector<float>* best_dot,
+-            std::vector<float>* second_dot);
++  // Top-2 dots of `a` against `b` into `ab`. With `backward` non-null the
++  // reverse direction is computed in the same GPU submission.
++  bool Match(const DescriptorSet& a,
++             const DescriptorSet& b,
++             Top2Result* ab,
++             Top2Result* ba);
+ 
+  private:
+   std::unique_ptr<SiftMetalMatcherImpl> impl_;
+diff --git a/src/thirdparty/SiftMetal/SiftMetalMatch.mm b/src/thirdparty/SiftMetal/SiftMetalMatch.mm
+index 688c6d4b..57879683 100644
+--- a/src/thirdparty/SiftMetal/SiftMetalMatch.mm
++++ b/src/thirdparty/SiftMetal/SiftMetalMatch.mm
+@@ -1,15 +1,21 @@
+ // SiftMetalMatch.mm - Metal brute-force SIFT descriptor matching.
++//
++// Descriptor uploads are cached per image key, so sequential/exhaustive
++// matching copies each image to the GPU once instead of once per pair, and
++// both cross-check directions go into a single command buffer.
+ 
+ #import <Foundation/Foundation.h>
+ #import <Metal/Metal.h>
+ 
+ #include "SiftMetalMatch.h"
+ 
++#include <algorithm>
+ #include <cstring>
+ #include <limits.h>
+ #include <mach-o/dyld.h>
+ #include <stdlib.h>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ #ifndef SIFT_METAL_METALLIB_PATH
+@@ -21,6 +27,10 @@
+ 
+ constexpr int kDescriptorDim = 128;
+ 
++// Enough for two exhaustive-matcher blocks (default block size 50) plus the
++// sliding window of sequential matching; ~1 MB per 8k-feature image.
++constexpr size_t kUploadCacheEntries = 256;
++
+ NSString* ExecutableDirectory() {
+   uint32_t size = 0;
+   _NSGetExecutablePath(nullptr, &size);
+@@ -70,32 +80,78 @@
+                              options:MTLResourceStorageModeShared];
+ }
+ 
++NSUInteger DescriptorBytes(int rows) {
++  return static_cast<NSUInteger>(rows) * kDescriptorDim;
++}
++
++// Output buffers for one match direction, grown on demand.
++struct DirectionBuffers {
++  id<MTLBuffer> bestIdx = nil;
++  id<MTLBuffer> bestDot = nil;
++  id<MTLBuffer> secondDot = nil;
++  int capacity = 0;
++
++  bool Ensure(id<MTLDevice> device, int rows) {
++    if (rows <= capacity) return true;
++    const NSUInteger n = static_cast<NSUInteger>(rows);
++    bestIdx = SharedBuffer(device, n * sizeof(int));
++    bestDot = SharedBuffer(device, n * sizeof(float));
++    secondDot = SharedBuffer(device, n * sizeof(float));
++    if (!bestIdx || !bestDot || !secondDot) return false;
++    capacity = rows;
++    return true;
++  }
++
++  void ReadInto(int rows, Top2Result* out) const {
++    out->best_idx.resize(rows);
++    out->best_dot.resize(rows);
++    out->second_dot.resize(rows);
++    if (rows == 0) return;
++    std::memcpy(out->best_idx.data(), bestIdx.contents, rows * sizeof(int));
++    std::memcpy(out->best_dot.data(), bestDot.contents, rows * sizeof(float));
++    std::memcpy(out->second_dot.data(), secondDot.contents,
++                rows * sizeof(float));
++  }
++};
++
+ }  // namespace
+ 
+ class SiftMetalMatcherImpl {
+  public:
+   bool Init();
+-  bool Top2(int num_queries,
+-            const uint8_t* queries,
+-            int num_index,
+-            const uint8_t* index,
+-            std::vector<int>* best_idx,
+-            std::vector<float>* best_dot,
+-            std::vector<float>* second_dot);
++  bool Match(const DescriptorSet& a,
++             const DescriptorSet& b,
++             Top2Result* ab,
++             Top2Result* ba);
+ 
+  private:
+-  bool EnsureCapacity(int num_queries, int num_index);
++  struct Upload {
++    id<MTLBuffer> buffer = nil;
++    int rows = 0;
++    uint64_t lastUse = 0;
++  };
++
++  // Returns a GPU buffer holding `set`, reusing a cached upload for the key.
++  // Uncached sets (negative key) are copied into `scratch`.
++  id<MTLBuffer> UploadDescriptors(const DescriptorSet& set,
++                                  __strong id<MTLBuffer>& scratch);
++  void EvictOldestUpload();
++  void EncodeTop2(id<MTLComputeCommandEncoder> enc,
++                  id<MTLBuffer> queries, int num_queries,
++                  id<MTLBuffer> index, int num_index,
++                  const DirectionBuffers& out);
+ 
+   id<MTLDevice> device_ = nil;
+   id<MTLCommandQueue> commandQueue_ = nil;
+   id<MTLComputePipelineState> pipeline_ = nil;
+-  id<MTLBuffer> queries_ = nil;
+-  id<MTLBuffer> index_ = nil;
+-  id<MTLBuffer> bestIdx_ = nil;
+-  id<MTLBuffer> bestDot_ = nil;
+-  id<MTLBuffer> secondDot_ = nil;
+-  int query_cap_ = 0;
+-  int index_cap_ = 0;
++
++  std::unordered_map<int64_t, Upload> uploads_;
++  uint64_t uploadClock_ = 0;
++  id<MTLBuffer> scratchA_ = nil;
++  id<MTLBuffer> scratchB_ = nil;
++
++  DirectionBuffers forward_;
++  DirectionBuffers backward_;
+ };
+ 
+ bool SiftMetalMatcherImpl::Init() {
+@@ -126,75 +182,103 @@ bool Top2(int num_queries,
+   return true;
+ }
+ 
+-bool SiftMetalMatcherImpl::EnsureCapacity(int num_queries, int num_index) {
+-  if (num_queries > query_cap_) {
+-    queries_ = SharedBuffer(device_,
+-                            static_cast<NSUInteger>(num_queries) * kDescriptorDim);
+-    bestIdx_ =
+-        SharedBuffer(device_, static_cast<NSUInteger>(num_queries) * sizeof(int));
+-    bestDot_ =
+-        SharedBuffer(device_, static_cast<NSUInteger>(num_queries) * sizeof(float));
+-    secondDot_ =
+-        SharedBuffer(device_, static_cast<NSUInteger>(num_queries) * sizeof(float));
+-    if (!queries_ || !bestIdx_ || !bestDot_ || !secondDot_) {
+-      return false;
++void SiftMetalMatcherImpl::EvictOldestUpload() {
++  auto oldest = uploads_.end();
++  for (auto it = uploads_.begin(); it != uploads_.end(); ++it) {
++    if (oldest == uploads_.end() || it->second.lastUse < oldest->second.lastUse) {
++      oldest = it;
+     }
+-    query_cap_ = num_queries;
+   }
+-  if (num_index > index_cap_) {
+-    index_ = SharedBuffer(device_,
+-                          static_cast<NSUInteger>(num_index) * kDescriptorDim);
+-    if (!index_) {
+-      return false;
+-    }
+-    index_cap_ = num_index;
++  if (oldest != uploads_.end()) {
++    uploads_.erase(oldest);
+   }
+-  return true;
+ }
+ 
+-bool SiftMetalMatcherImpl::Top2(int num_queries,
+-                                const uint8_t* queries,
+-                                int num_index,
+-                                const uint8_t* index,
+-                                std::vector<int>* best_idx,
+-                                std::vector<float>* best_dot,
+-                                std::vector<float>* second_dot) {
+-  best_idx->assign(num_queries, -1);
+-  best_dot->assign(num_queries, 0.f);
+-  second_dot->assign(num_queries, 0.f);
+-  if (num_queries == 0) {
+-    return true;
+-  }
+-  if (num_index == 0) {
+-    return true;
++id<MTLBuffer> SiftMetalMatcherImpl::UploadDescriptors(const DescriptorSet& set,
++                                                      __strong id<MTLBuffer>& scratch) {
++  const NSUInteger bytes = DescriptorBytes(set.rows);
++  if (set.key < 0) {
++    if (scratch == nil || scratch.length < bytes) {
++      scratch = SharedBuffer(device_, bytes);
++      if (!scratch) return nil;
++    }
++    std::memcpy(scratch.contents, set.data, bytes);
++    return scratch;
+   }
+-  if (!EnsureCapacity(num_queries, num_index)) {
+-    return false;
++
++  auto it = uploads_.find(set.key);
++  if (it != uploads_.end() && it->second.rows == set.rows) {
++    it->second.lastUse = ++uploadClock_;
++    return it->second.buffer;
+   }
+ 
+-  std::memcpy(queries_.contents, queries,
+-              static_cast<size_t>(num_queries) * kDescriptorDim);
+-  std::memcpy(index_.contents, index,
+-              static_cast<size_t>(num_index) * kDescriptorDim);
++  if (it == uploads_.end() && uploads_.size() >= kUploadCacheEntries) {
++    EvictOldestUpload();
++  }
++  Upload upload;
++  upload.buffer = SharedBuffer(device_, bytes);
++  if (!upload.buffer) return nil;
++  std::memcpy(upload.buffer.contents, set.data, bytes);
++  upload.rows = set.rows;
++  upload.lastUse = ++uploadClock_;
++  uploads_[set.key] = upload;
++  return upload.buffer;
++}
+ 
++void SiftMetalMatcherImpl::EncodeTop2(id<MTLComputeCommandEncoder> enc,
++                                      id<MTLBuffer> queries, int num_queries,
++                                      id<MTLBuffer> index, int num_index,
++                                      const DirectionBuffers& out) {
+   uint32_t n_queries = static_cast<uint32_t>(num_queries);
+   uint32_t n_index = static_cast<uint32_t>(num_index);
+-
+-  id<MTLCommandBuffer> cb = [commandQueue_ commandBuffer];
+-  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+   [enc setComputePipelineState:pipeline_];
+-  [enc setBuffer:queries_ offset:0 atIndex:0];
+-  [enc setBuffer:index_ offset:0 atIndex:1];
+-  [enc setBuffer:bestIdx_ offset:0 atIndex:2];
+-  [enc setBuffer:bestDot_ offset:0 atIndex:3];
+-  [enc setBuffer:secondDot_ offset:0 atIndex:4];
++  [enc setBuffer:queries offset:0 atIndex:0];
++  [enc setBuffer:index offset:0 atIndex:1];
++  [enc setBuffer:out.bestIdx offset:0 atIndex:2];
++  [enc setBuffer:out.bestDot offset:0 atIndex:3];
++  [enc setBuffer:out.secondDot offset:0 atIndex:4];
+   [enc setBytes:&n_queries length:sizeof(n_queries) atIndex:5];
+   [enc setBytes:&n_index length:sizeof(n_index) atIndex:6];
+ 
+-  const NSUInteger width = pipeline_.threadExecutionWidth;
++  const NSUInteger width =
++      std::min<NSUInteger>(64, pipeline_.maxTotalThreadsPerThreadgroup);
+   MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(num_queries), 1, 1);
+   MTLSize groups = MTLSizeMake(width, 1, 1);
+   [enc dispatchThreads:threads threadsPerThreadgroup:groups];
++}
++
++bool SiftMetalMatcherImpl::Match(const DescriptorSet& a,
++                                 const DescriptorSet& b,
++                                 Top2Result* ab,
++                                 Top2Result* ba) {
++  ab->best_idx.assign(a.rows, -1);
++  ab->best_dot.assign(a.rows, 0.f);
++  ab->second_dot.assign(a.rows, 0.f);
++  if (ba) {
++    ba->best_idx.assign(b.rows, -1);
++    ba->best_dot.assign(b.rows, 0.f);
++    ba->second_dot.assign(b.rows, 0.f);
++  }
++  if (a.rows == 0 || b.rows == 0) {
++    return true;
++  }
++
++  id<MTLBuffer> bufA = UploadDescriptors(a, scratchA_);
++  id<MTLBuffer> bufB = UploadDescriptors(b, scratchB_);
++  if (!bufA || !bufB) {
++    return false;
++  }
++  if (!forward_.Ensure(device_, a.rows) ||
++      (ba && !backward_.Ensure(device_, b.rows))) {
++    return false;
++  }
++
++  id<MTLCommandBuffer> cb = [commandQueue_ commandBuffer];
++  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++  EncodeTop2(enc, bufA, a.rows, bufB, b.rows, forward_);
++  if (ba) {
++    EncodeTop2(enc, bufB, b.rows, bufA, a.rows, backward_);
++  }
+   [enc endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+@@ -203,12 +287,10 @@ bool Top2(int num_queries,
+     return false;
+   }
+ 
+-  std::memcpy(best_idx->data(), bestIdx_.contents,
+-              static_cast<size_t>(num_queries) * sizeof(int));
+-  std::memcpy(best_dot->data(), bestDot_.contents,
+-              static_cast<size_t>(num_queries) * sizeof(float));
+-  std::memcpy(second_dot->data(), secondDot_.contents,
+-              static_cast<size_t>(num_queries) * sizeof(float));
++  forward_.ReadInto(a.rows, ab);
++  if (ba) {
++    backward_.ReadInto(b.rows, ba);
++  }
+   return true;
+ }
+ 
+@@ -219,20 +301,11 @@ bool Top2(int num_queries,
+ 
+ bool SiftMetalMatcher::Init() { return impl_->Init(); }
+ 
+-bool SiftMetalMatcher::Top2(int num_queries,
+-                            const uint8_t* queries,
+-                            int num_index,
+-                            const uint8_t* index,
+-                            std::vector<int>* best_idx,
+-                            std::vector<float>* best_dot,
+-                            std::vector<float>* second_dot) {
+-  return impl_->Top2(num_queries,
+-                     queries,
+-                     num_index,
+-                     index,
+-                     best_idx,
+-                     best_dot,
+-                     second_dot);
++bool SiftMetalMatcher::Match(const DescriptorSet& a,
++                             const DescriptorSet& b,
++                             Top2Result* ab,
++                             Top2Result* ba) {
++  return impl_->Match(a, b, ab, ba);
+ }
+ 
+ }  // namespace sift_metal
+diff --git a/src/thirdparty/SiftMetal/include/SIFTExtrema.h b/src/thirdparty/SiftMetal/include/SIFTExtrema.h
+index 8578e60c..73aaee75 100644
+--- a/src/thirdparty/SiftMetal/include/SIFTExtrema.h
++++ b/src/thirdparty/SiftMetal/include/SIFTExtrema.h
+@@ -17,4 +17,12 @@ struct SIFTExtremaResult {
+     int32_t scale;
+ };
+ 
++// Detection-time filter for siftExtremaList. `threshold` drops low-contrast
++// candidates before the neighbour test (SiftGPU uses 0.8 x DoG threshold);
++// `maxResults` is the capacity of the output buffer.
++struct SIFTExtremaParameters {
++    float threshold;
++    uint32_t maxResults;
++};
++
+ #endif /* SIFTExtrema_h */
+diff --git a/src/thirdparty/SiftMetal/shaders/Convolution.metal b/src/thirdparty/SiftMetal/shaders/Convolution.metal
+index cc37dae0..fb0224f4 100644
+--- a/src/thirdparty/SiftMetal/shaders/Convolution.metal
++++ b/src/thirdparty/SiftMetal/shaders/Convolution.metal
+@@ -12,21 +12,29 @@
+ using namespace metal;
+ 
+ 
++// See ConvolutionSeries.metal: hardware mirrored_repeat replaces the
++// per-tap integer modulo of symmetrizedCoordinates().
++constexpr sampler mirrorSampler(coord::normalized,
++                                address::mirrored_repeat,
++                                filter::nearest);
++
++
+ kernel void convolutionX(
+     texture2d<float, access::write> outputTexture [[texture(0)]],
+-    texture2d<float, access::read> inputTexture [[texture(1)]],
+-    device float * weights [[buffer(0)]],
+-    device uint & numberOfWeights [[buffer(1)]],
++    texture2d<float, access::sample> inputTexture [[texture(1)]],
++    constant float * weights [[buffer(0)]],
++    constant uint & numberOfWeights [[buffer(1)]],
+     ushort2 gid [[thread_position_in_grid]]
+ ) {
+-    const int width = inputTexture.get_width();
++    const float2 invSize = 1.0 / float2(inputTexture.get_width(), inputTexture.get_height());
+     
+     float sum = 0;
+     const int n = (int)numberOfWeights;
+     const int o = (int)gid.x - (n / 2);
++    const float v = ((float)gid.y + 0.5) * invSize.y;
+     for (int i = 0; i < n; i++) {
+-        int x = symmetrizedCoordinates(o + i, width);
+-        sum += weights[i] * inputTexture.read(ushort2(x, gid.y)).r;
++        const float u = ((float)(o + i) + 0.5) * invSize.x;
++        sum += weights[i] * inputTexture.sample(mirrorSampler, float2(u, v)).r;
+     }
+     outputTexture.write(float4(sum, 0, 0, 1), gid);
+ }
+@@ -34,19 +42,20 @@ kernel void convolutionX(
+ 
+ kernel void convolutionY(
+     texture2d<float, access::write> outputTexture [[texture(0)]],
+-    texture2d<float, access::read> inputTexture [[texture(1)]],
+-    device float * weights [[buffer(0)]],
+-    device uint & numberOfWeights [[buffer(1)]],
++    texture2d<float, access::sample> inputTexture [[texture(1)]],
++    constant float * weights [[buffer(0)]],
++    constant uint & numberOfWeights [[buffer(1)]],
+     ushort2 gid [[thread_position_in_grid]]
+ ) {
+-    const int height = inputTexture.get_height();
++    const float2 invSize = 1.0 / float2(inputTexture.get_width(), inputTexture.get_height());
+     
+     float sum = 0;
+     const int n = (int)numberOfWeights;
+     const int o = (int)gid.y - (n / 2);
++    const float u = ((float)gid.x + 0.5) * invSize.x;
+     for (int i = 0; i < n; i++) {
+-        int y = symmetrizedCoordinates(o + i, height);
+-        sum += weights[i] * inputTexture.read(ushort2(gid.x, y)).r;
++        const float v = ((float)(o + i) + 0.5) * invSize.y;
++        sum += weights[i] * inputTexture.sample(mirrorSampler, float2(u, v)).r;
+     }
+     outputTexture.write(float4(sum, 0, 0, 1), gid);
+ }
+diff --git a/src/thirdparty/SiftMetal/shaders/ConvolutionSeries.metal b/src/thirdparty/SiftMetal/shaders/ConvolutionSeries.metal
+index 29d9a66e..6440efb9 100644
+--- a/src/thirdparty/SiftMetal/shaders/ConvolutionSeries.metal
++++ b/src/thirdparty/SiftMetal/shaders/ConvolutionSeries.metal
+@@ -13,20 +13,29 @@
+ using namespace metal;
+ 
+ 
++// mirrored_repeat on normalised coordinates is the half-sample symmetric
++// extension (-1 -> 0, -2 -> 1, w -> w-1) that symmetrizedCoordinates()
++// computed with an integer modulo per tap. The sampler does it for free.
++constexpr sampler mirrorSampler(coord::normalized,
++                                address::mirrored_repeat,
++                                filter::nearest);
++
++
+ kernel void convolutionSeriesX(
+     texture2d_array<float, access::write> outputTexture [[texture(0)]],
+-    texture2d_array<float, access::read> inputTexture [[texture(1)]],
+-    device ConvolutionParameters & parameters [[buffer(0)]],
++    texture2d_array<float, access::sample> inputTexture [[texture(1)]],
++    constant ConvolutionParameters & parameters [[buffer(0)]],
+     ushort2 gid [[thread_position_in_grid]]
+ ) {
+-    const int width = inputTexture.get_width();
++    const float2 invSize = 1.0 / float2(inputTexture.get_width(), inputTexture.get_height());
+     
+     float sum = 0;
+     const int n = (int)parameters.count;
+     const int o = (int)gid.x - (n / 2);
++    const float v = ((float)gid.y + 0.5) * invSize.y;
+     for (int i = 0; i < n; i++) {
+-        int x = symmetrizedCoordinates(o + i, width);
+-        float c = inputTexture.read(ushort2(x, gid.y), parameters.inputDepth).r;
++        const float u = ((float)(o + i) + 0.5) * invSize.x;
++        const float c = inputTexture.sample(mirrorSampler, float2(u, v), parameters.inputDepth).r;
+         sum += parameters.weights[i] * c;
+     }
+     outputTexture.write(float4(sum, 0, 0, 1), gid, parameters.outputDepth);
+@@ -35,18 +44,19 @@ kernel void convolutionSeriesX(
+ 
+ kernel void convolutionSeriesY(
+     texture2d_array<float, access::write> outputTexture [[texture(0)]],
+-    texture2d_array<float, access::read> inputTexture [[texture(1)]],
+-    device ConvolutionParameters & parameters [[buffer(0)]],
++    texture2d_array<float, access::sample> inputTexture [[texture(1)]],
++    constant ConvolutionParameters & parameters [[buffer(0)]],
+     ushort2 gid [[thread_position_in_grid]]
+ ) {
+-    const int height = inputTexture.get_height();
++    const float2 invSize = 1.0 / float2(inputTexture.get_width(), inputTexture.get_height());
+     
+     float sum = 0;
+     const int n = (int)parameters.count;
+     const int o = (int)gid.y - (n / 2);
++    const float u = ((float)gid.x + 0.5) * invSize.x;
+     for (int i = 0; i < n; i++) {
+-        int y = symmetrizedCoordinates(o + i, height);
+-        float c = inputTexture.read(ushort2(gid.x, y), parameters.inputDepth).r;
++        const float v = ((float)(o + i) + 0.5) * invSize.y;
++        const float c = inputTexture.sample(mirrorSampler, float2(u, v), parameters.inputDepth).r;
+         sum += parameters.weights[i] * c;
+     }
+     outputTexture.write(float4(sum, 0, 0, 1), gid, parameters.outputDepth);
+diff --git a/src/thirdparty/SiftMetal/shaders/SIFTExtrema.metal b/src/thirdparty/SiftMetal/shaders/SIFTExtrema.metal
+index da3a0804..00b1c443 100644
+--- a/src/thirdparty/SiftMetal/shaders/SIFTExtrema.metal
++++ b/src/thirdparty/SiftMetal/shaders/SIFTExtrema.metal
+@@ -59,35 +59,53 @@ static inline float fetch(
+ }
+ 
+ 
++// True when the DoG sample is a strict 3x3x3 extremum. Candidates whose
++// magnitude is below the contrast threshold are rejected without touching
++// the 26 neighbours, which is where most flat-region samples fall out.
++static inline bool isExtremum(
++    texture2d_array<float, access::read> texture,
++    const int2 g,
++    const int s,
++    const float threshold
++) {
++    const float value = texture.read((ushort2)g, (ushort)s).r;
++    if (abs(value) <= threshold) {
++        return false;
++    }
++
++    float minimum = +1000;
++    float maximum = -1000;
++    for (int i = 0; i < 26; i++) {
++        const float neighborValue = fetch(texture, g, s, i);
++        minimum = min(minimum, neighborValue);
++        maximum = max(maximum, neighborValue);
++    }
++    return (value < minimum) || (value > maximum);
++}
++
++
+ kernel void siftExtremaList(
+     device SIFTExtremaResult * output [[buffer(0)]],
+     device atomic_uint * outputCount [[buffer(1)]],
++    constant SIFTExtremaParameters & parameters [[buffer(2)]],
+     texture2d_array<float, access::read> inputTexture [[texture(0)]],
+     ushort3 gid [[thread_position_in_grid]],
+-    ushort3 lid [[thread_position_in_threadgroup]],
+     ushort tid [[thread_index_in_threadgroup]]
+ ) {
+-    // Thread group runs [0...output.width - 2][0...output.height - 2]
++    // Grid runs [0...width - 2][0...height - 2][0...scales - 2]; the +1 keeps
++    // the 3x3x3 neighbourhood inside the texture.
+     const ushort threadsInThreadgroup = 1024;
+     threadgroup SIFTExtremaResult localResults[threadsInThreadgroup];
+     threadgroup atomic_int localCount;
+-    atomic_store_explicit(&localCount, 0, memory_order_relaxed);
+-    threadgroup_barrier(mem_flags::mem_none);
++    if (tid == 0) {
++        atomic_store_explicit(&localCount, 0, memory_order_relaxed);
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
+     
+     const int2 g = (int2)gid.xy + 1;
+     const int s = (int)gid.z + 1;
+-    const float value = inputTexture.read((ushort2)g, (ushort)s).r;
+-    
+-    float minimum = +1000;
+-    float maximum = -1000;
+-
+-    for (int i = 1; i < 26; i++) {
+-        float neighborValue = fetch(inputTexture, g, s, i);
+-        minimum = min(minimum, neighborValue);
+-        maximum = max(maximum, neighborValue);
+-    }
+ 
+-    if ((value < minimum) || (value > maximum)) {
++    if (isExtremum(inputTexture, g, s, parameters.threshold)) {
+         const int i = atomic_fetch_add_explicit(&localCount, 1, memory_order_relaxed);
+         SIFTExtremaResult result;
+         result.x = g.x;
+@@ -96,13 +114,16 @@ kernel void siftExtremaList(
+         localResults[i] = result;
+     }
+     
+-    // Copy local results to output
+-    threadgroup_barrier(mem_flags::mem_none);
++    // Copy local results to output, clamped to the buffer capacity.
++    threadgroup_barrier(mem_flags::mem_threadgroup);
+     if (tid == 0) {
+         const int count = atomic_load_explicit(&localCount, memory_order_relaxed);
+         if (count > 0) {
+-            const int b = atomic_fetch_add_explicit(outputCount, count, memory_order_relaxed);
+-            for (int i = 0; i < count; i++) {
++            const uint b = atomic_fetch_add_explicit(outputCount, (uint)count, memory_order_relaxed);
++            const uint capacity = parameters.maxResults;
++            const uint available = b < capacity ? capacity - b : 0;
++            const int n = (int)min((uint)count, available);
++            for (int i = 0; i < n; i++) {
+                 output[b + i] = localResults[i];
+             }
+         }
+diff --git a/src/thirdparty/SiftMetal/shaders/SIFTGradient.metal b/src/thirdparty/SiftMetal/shaders/SIFTGradient.metal
+index e1e83272..c3538d99 100644
+--- a/src/thirdparty/SiftMetal/shaders/SIFTGradient.metal
++++ b/src/thirdparty/SiftMetal/shaders/SIFTGradient.metal
+@@ -7,11 +7,11 @@
+ 
+ #include <metal_stdlib>
+ 
+-#include "Common.hpp"
+-
+ using namespace metal;
+ 
+ 
++// Central differences with the half-sample symmetric border (-1 -> 0,
++// w -> w-1). For a +-1 offset that is a plain clamp, no modulo needed.
+ kernel void siftGradient(
+      texture2d_array<float, access::write> outputTexture [[texture(0)]],
+      texture2d_array<float, access::read> inputTexture [[texture(1)]],
+@@ -22,10 +22,10 @@ kernel void siftGradient(
+     const int gz = (int)gid.z;
+     const int dx = inputTexture.get_width();
+     const int dy = inputTexture.get_height();
+-    const ushort px = symmetrizedCoordinates(gx + 1, dx);
+-    const ushort mx = symmetrizedCoordinates(gx - 1, dx);
+-    const ushort py = symmetrizedCoordinates(gy + 1, dy);
+-    const ushort my = symmetrizedCoordinates(gy - 1, dy);
++    const ushort px = (ushort)min(gx + 1, dx - 1);
++    const ushort mx = (ushort)max(gx - 1, 0);
++    const ushort py = (ushort)min(gy + 1, dy - 1);
++    const ushort my = (ushort)max(gy - 1, 0);
+     const float cpx = inputTexture.read(ushort2(px, gy), gz).r;
+     const float cmx = inputTexture.read(ushort2(mx, gy), gz).r;
+     const float cpy = inputTexture.read(ushort2(gx, py), gz).r;
+diff --git a/src/thirdparty/SiftMetal/shaders/SiftMatch.metal b/src/thirdparty/SiftMetal/shaders/SiftMatch.metal
+index 938d1ee1..cfb0641f 100644
+--- a/src/thirdparty/SiftMetal/shaders/SiftMatch.metal
++++ b/src/thirdparty/SiftMetal/shaders/SiftMatch.metal
+@@ -3,8 +3,15 @@ using namespace metal;
+ 
+ // One thread per query descriptor. Exact uint8 dot product vs all index rows,
+ // keeping the top-2 scores for Lowe's ratio test on the CPU.
+-kernel void sift_match_top2(device const uchar* queries [[buffer(0)]],
+-                            device const uchar* index [[buffer(1)]],
++//
++// The 128-byte query is pulled into registers once as 32 x ushort4; index
++// rows are read as uchar4 words, which every lane of a SIMD group reads at the
++// same address (broadcast). Products fit ushort (255*255 < 65536), sums are
++// accumulated exactly in uint and only converted to float on output, so the
++// scores match the previous float kernel bit for bit. (A float FMA variant
++// measured ~5% slower on M5 Pro.)
++kernel void sift_match_top2(device const uchar4* queries [[buffer(0)]],
++                            device const uchar4* index [[buffer(1)]],
+                             device int* best_idx [[buffer(2)]],
+                             device float* best_dot [[buffer(3)]],
+                             device float* second_dot [[buffer(4)]],
+@@ -15,31 +22,36 @@ kernel void sift_match_top2(device const uchar* queries [[buffer(0)]],
+     return;
+   }
+ 
+-  constexpr uint kDim = 128;
+-  const device uchar* query = queries + gid * kDim;
+-  float best = 0.0f;
+-  float second = 0.0f;
++  constexpr uint kWords = 32;  // 128 bytes as uchar4
++  ushort4 query[kWords];
++  {
++    const device uchar4* q = queries + gid * kWords;
++    for (uint k = 0; k < kWords; ++k) {
++      query[k] = ushort4(q[k]);
++    }
++  }
++
++  uint best = 0;
++  uint second = 0;
+   int best_j = -1;
+ 
+   for (uint j = 0; j < n_index; ++j) {
+-    const device uchar* row = index + j * kDim;
+-    float acc = 0.0f;
+-    for (uint k = 0; k < kDim; k += 4) {
+-      acc += float(query[k]) * float(row[k]) +
+-             float(query[k + 1]) * float(row[k + 1]) +
+-             float(query[k + 2]) * float(row[k + 2]) +
+-             float(query[k + 3]) * float(row[k + 3]);
++    const device uchar4* row = index + j * kWords;
++    uint4 acc = uint4(0);
++    for (uint k = 0; k < kWords; ++k) {
++      acc += uint4(query[k] * ushort4(row[k]));
+     }
+-    if (acc > best) {
++    const uint dot = acc.x + acc.y + acc.z + acc.w;
++    if (dot > best) {
+       second = best;
+-      best = acc;
++      best = dot;
+       best_j = int(j);
+-    } else if (acc > second) {
+-      second = acc;
++    } else if (dot > second) {
++      second = dot;
+     }
+   }
+ 
+   best_idx[gid] = best_j;
+-  best_dot[gid] = best;
+-  second_dot[gid] = second;
++  best_dot[gid] = float(best);
++  second_dot[gid] = float(second);
+ }

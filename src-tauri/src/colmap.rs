@@ -57,13 +57,8 @@ pub fn feature_extractor_spec(
         if knobs.single_camera { "1" } else { "0" }.into(),
         "--ImageReader.camera_model".into(),
         knobs.camera_model.as_colmap().into(),
-        "--FeatureExtraction.use_gpu".into(),
-        if knobs.sift_backend == SiftBackend::Metal {
-            "1".into()
-        } else {
-            "0".into()
-        },
     ];
+    args.extend(extraction_flags(knobs.sift_backend));
     if let Some(list) = image_list {
         args.push("--image_list_path".into());
         args.push(path_arg(list));
@@ -143,11 +138,35 @@ pub fn exhaustive_matcher_spec(database: &Path, settings: PipelineSettings) -> C
     CommandSpec::new("colmap", args)
 }
 
+/// COLMAP starts one GPU worker per `gpu_index` entry. The Metal SIFT code
+/// ignores the index itself, so listing it twice runs two extractors/matchers
+/// whose CPU-GPU sync gaps overlap. Measured on M5 Pro: 2 workers ~35% faster
+/// than 1, a third adds nothing.
+const METAL_GPU_WORKERS: &str = "0,0";
+
+/// Metal extraction runs on the SiftMetal sidecar; CPU is VLFeat.
+fn extraction_flags(sift: SiftBackend) -> Vec<String> {
+    match sift {
+        SiftBackend::Metal => vec![
+            "--FeatureExtraction.use_gpu".into(),
+            "1".into(),
+            "--FeatureExtraction.gpu_index".into(),
+            METAL_GPU_WORKERS.into(),
+        ],
+        SiftBackend::Cpu => vec!["--FeatureExtraction.use_gpu".into(), "0".into()],
+    }
+}
+
 /// Metal matching uses the SiftMetal GPU kernel. CPU matching skips FAISS:
 /// Homebrew FAISS 1.15 headers vs bundled FAISS shift the Index vtable.
 fn matching_flags(sift: SiftBackend) -> Vec<String> {
     match sift {
-        SiftBackend::Metal => vec!["--FeatureMatching.use_gpu".into(), "1".into()],
+        SiftBackend::Metal => vec![
+            "--FeatureMatching.use_gpu".into(),
+            "1".into(),
+            "--FeatureMatching.gpu_index".into(),
+            METAL_GPU_WORKERS.into(),
+        ],
         SiftBackend::Cpu => vec![
             "--FeatureMatching.use_gpu".into(),
             "0".into(),
@@ -441,6 +460,7 @@ mod tests {
             .args
             .iter()
             .any(|a| a.contains("SiftExtraction.max_image_size")));
+        assert!(!spec.args.iter().any(|a| a.contains("gpu_index")));
     }
 
     #[test]
@@ -454,11 +474,19 @@ mod tests {
             .args
             .windows(2)
             .any(|w| w[0] == "--FeatureExtraction.use_gpu" && w[1] == "1"));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--FeatureExtraction.gpu_index" && w[1] == "0,0"));
         let matcher = sequential_matcher_spec(Path::new("db"), settings);
         assert!(matcher
             .args
             .windows(2)
             .any(|w| w[0] == "--FeatureMatching.use_gpu" && w[1] == "1"));
+        assert!(matcher
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--FeatureMatching.gpu_index" && w[1] == "0,0"));
         assert!(!matcher
             .args
             .iter()

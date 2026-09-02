@@ -21,3 +21,9 @@ Named presets stay on CPU; Expert/Custom can switch SIFT to Metal.
 Matching stays CPU Eigen brute-force unless SIFT is Metal, which uses a
 GPU matcher in `sift.metallib`. Rebuild with `--colmap-metal` so Homebrew
 FAISS 1.15 headers do not shadow the bundled FAISS include path.
+
+The Metal build carries `scripts/patches/sift-metal-performance.patch`
+(batched GPU sync, private textures, extrema pre-threshold and bounds
+check, per-image descriptor upload cache). The app runs two Metal workers
+(`gpu_index 0,0`) for extraction and matching; a sidecar built without the
+patch still works with those flags, just slower.

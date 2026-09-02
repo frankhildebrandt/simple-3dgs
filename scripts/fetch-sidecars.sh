@@ -198,6 +198,9 @@ build_colmap_metal() {
   git -C "$src" apply "$patch"
   git -C "$src" apply "$ROOT/scripts/patches/faiss-cpu-matcher-index-flat.patch"
   git -C "$src" apply "$ROOT/scripts/patches/sift-metal-matcher.patch"
+  # Batched GPU sync, private textures, extrema pre-threshold + bounds check,
+  # descriptor upload cache. Depends on the matcher patch above.
+  git -C "$src" apply "$ROOT/scripts/patches/sift-metal-performance.patch"
 
   local build="$src/build-simple-3dgs"
   local prefix="$VENDOR/colmap-metal-prefix"
