@@ -3,6 +3,9 @@ import type {
   AppConfig,
   ArchiveEntry,
   PipelineRequest,
+  PipelinePlan,
+  PipelineLogPage,
+  PipelineRunSummary,
   ProjectEntry,
   ProjectFrame,
   RunResult,
@@ -13,8 +16,16 @@ export function startPipeline(request: PipelineRequest): Promise<RunResult> {
   return invoke<RunResult>("start_pipeline", { request });
 }
 
+export function planPipeline(request: PipelineRequest): Promise<PipelinePlan> {
+  return invoke<PipelinePlan>("plan_pipeline", { request });
+}
+
 export function cancelPipeline(): Promise<void> {
   return invoke<void>("cancel_pipeline");
+}
+
+export function setPreviewVisibility(visible: boolean): Promise<void> {
+  return invoke<void>("set_preview_visibility", { visible });
 }
 
 export function getConfig(): Promise<AppConfig> {
@@ -109,4 +120,17 @@ export function getSparsePreview(projectDir: string): Promise<SparsePreview> {
 
 export function getPipelineLogs(): Promise<string[]> {
   return invoke<string[]>("pipeline_logs");
+}
+
+export function listPipelineRuns(projectDir: string): Promise<PipelineRunSummary[]> {
+  return invoke<PipelineRunSummary[]>("list_pipeline_runs", { projectDir });
+}
+
+export function getPipelineLogPage(
+  projectDir: string,
+  runId: string,
+  before?: number | null,
+  limit = 250,
+): Promise<PipelineLogPage> {
+  return invoke<PipelineLogPage>("pipeline_log_page", { projectDir, runId, before: before ?? null, limit });
 }

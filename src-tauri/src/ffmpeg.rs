@@ -45,7 +45,8 @@ pub fn candidate_spec_with_hwaccel(
 /// Full-resolution stills at the selected candidate indices (`n` after `fps=`).
 /// Consecutive `n` become `between()`; terms are a balanced `+` tree so FFmpeg's
 /// expr parser does not hit ENOMEM. Graphs over [`FILTER_SCRIPT_MIN_CHARS`]
-/// write `select.filter` and use `-filter_script`.
+/// write `select.filter` and load it with `-/filter:v` (FFmpeg 7+; `-filter_script`
+/// was removed in 9).
 pub fn select_spec(
     video: &Path,
     frames_dir: &Path,
@@ -154,7 +155,7 @@ fn push_filter(args: &mut Vec<String>, req: &ExtractArgs<'_>) {
     if req.indices.is_some() && script_graph.len() >= FILTER_SCRIPT_MIN_CHARS {
         let path = req.out_dir.join(SELECT_FILTER_FILE);
         if fs::write(&path, script_graph).is_ok() {
-            args.push("-filter_script".into());
+            args.push("-/filter:v".into());
             args.push(path_arg(&path));
             return;
         }
@@ -399,14 +400,19 @@ mod tests {
             .unwrap();
         assert!(vf.contains("between(n\\,10\\,20)"), "got {vf}");
         assert!(!vf.contains("eq(n\\,11)"));
-        assert!(!spec.args.contains(&"-filter_script".into()));
+        assert!(!spec.args.contains(&"-/filter:v".into()));
     }
 
     #[test]
     fn dense_tail_does_not_emit_per_frame_eq() {
         let mut indices: Vec<usize> = (0..120).map(|i| i * 3).collect();
         indices.extend(374..=500);
-        let spec = select_spec(Path::new("clip.mp4"), Path::new("frames"), balanced(), &indices);
+        let spec = select_spec(
+            Path::new("clip.mp4"),
+            Path::new("frames"),
+            balanced(),
+            &indices,
+        );
         let vf = spec
             .args
             .windows(2)
@@ -416,13 +422,21 @@ mod tests {
         assert!(vf.contains("between(n\\,374\\,500)"), "got {vf}");
         assert!(vf.contains("eq(n\\,0)"));
         assert!(!vf.contains("eq(n\\,375)"));
-        assert!(vf.contains('('), "balanced + tree should parenthesize, got {vf}");
+        assert!(
+            vf.contains('('),
+            "balanced + tree should parenthesize, got {vf}"
+        );
     }
 
     #[test]
     fn many_consecutive_indices_stay_on_vf() {
         let indices: Vec<_> = (0..500).collect();
-        let spec = select_spec(Path::new("clip.mp4"), Path::new("frames"), balanced(), &indices);
+        let spec = select_spec(
+            Path::new("clip.mp4"),
+            Path::new("frames"),
+            balanced(),
+            &indices,
+        );
         let vf = spec
             .args
             .windows(2)
@@ -430,7 +444,7 @@ mod tests {
             .map(|w| w[1].as_str())
             .unwrap();
         assert!(vf.contains("between(n\\,0\\,499)"), "got {vf}");
-        assert!(!spec.args.contains(&"-filter_script".into()));
+        assert!(!spec.args.contains(&"-/filter:v".into()));
     }
 
     #[test]
@@ -444,7 +458,7 @@ mod tests {
         assert!(spec
             .args
             .windows(2)
-            .any(|w| w[0] == "-filter_script" && w[1] == path_arg(&script)));
+            .any(|w| w[0] == "-/filter:v" && w[1] == path_arg(&script)));
         assert!(!spec.args.contains(&"-vf".into()));
         let graph = fs::read_to_string(&script).unwrap();
         assert!(graph.contains("eq(n,0)"));

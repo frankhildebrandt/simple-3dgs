@@ -13,8 +13,15 @@ export function logWindowLabel(): string {
   return "pipeline-log";
 }
 
-export function logWindowUrl(): string {
-  return "/?log=1";
+export function logWindowUrl(projectDir?: string | null): string {
+  const params = new URLSearchParams({ log: "1" });
+  if (projectDir) params.set("project", projectDir);
+  return `/?${params.toString()}`;
+}
+
+export function logProjectFromSearch(search: string): string | null {
+  const query = search.startsWith("?") ? search.slice(1) : search;
+  return new URLSearchParams(query).get("project");
 }
 
 /** Joins retained log lines for display and clipboard. */

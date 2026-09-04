@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isLogWindowSearch, logText, logWindowLabel, logWindowUrl } from "./logWindow";
+import { isLogWindowSearch, logProjectFromSearch, logText, logWindowLabel, logWindowUrl } from "./logWindow";
 
 describe("isLogWindowSearch", () => {
   it("detects the log query param", () => {
@@ -25,6 +25,7 @@ describe("logWindowLabel", () => {
 describe("logWindowUrl", () => {
   it("points at the log webview", () => {
     expect(logWindowUrl()).toBe("/?log=1");
+    expect(logProjectFromSearch(logWindowUrl("/tmp/My Project"))).toBe("/tmp/My Project");
   });
 });
 

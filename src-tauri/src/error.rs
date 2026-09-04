@@ -203,7 +203,9 @@ This application failed to start because no Qt platform plugin could be initiali
         let err = PipelineError::colmap_failed_with(1, log, CaptureMode::Object);
         let msg = err.to_string();
         assert!(msg.contains("GPU SIFT"));
-        assert!(msg.contains("Qt/OpenGL") || msg.contains("cocoa") || msg.contains("platform plugin"));
+        assert!(
+            msg.contains("Qt/OpenGL") || msg.contains("cocoa") || msg.contains("platform plugin")
+        );
         assert!(msg.contains("--colmap-metal"));
         assert!(!msg.contains("slower orbit"));
         assert!(!msg.contains("0x189d5fe00"));

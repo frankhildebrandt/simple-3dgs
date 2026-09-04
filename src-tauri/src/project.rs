@@ -382,6 +382,23 @@ pub fn newest_export_ply(dir: &Path) -> Option<PathBuf> {
     best.map(|(_, path)| path)
 }
 
+/// Keeps only the newest Brush resume checkpoints. The canonical scene is untouched.
+pub fn prune_export_checkpoints(dir: &Path, keep: usize) -> Result<(), PipelineError> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let mut exports = fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter_map(|path| export_iter(&path).map(|iter| (iter, path)))
+        .collect::<Vec<_>>();
+    exports.sort_by_key(|(iter, _)| std::cmp::Reverse(*iter));
+    for (_, path) in exports.into_iter().skip(keep) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn export_iter(path: &Path) -> Option<u32> {
     if path.extension().and_then(|e| e.to_str()) != Some("ply") {
         return None;
@@ -415,8 +432,7 @@ pub fn finalize_ply(export_dir: &Path, dest: &Path) -> Result<(), PipelineError>
         return Ok(());
     }
     fs::create_dir_all(dest.parent().unwrap_or(export_dir))?;
-    fs::copy(src, dest)?;
-    Ok(())
+    link_or_copy(&src, dest)
 }
 
 pub(crate) fn link_or_copy(src: &Path, dest: &Path) -> Result<(), PipelineError> {

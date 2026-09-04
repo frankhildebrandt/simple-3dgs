@@ -143,7 +143,10 @@ mod tests {
     #[test]
     fn named_profiles_stay_on_cpu_sift() {
         for mode in [CaptureMode::Object, CaptureMode::Room, CaptureMode::Outdoor] {
-            assert_eq!(ColmapKnobs::for_capture(mode).sift_backend, SiftBackend::Cpu);
+            assert_eq!(
+                ColmapKnobs::for_capture(mode).sift_backend,
+                SiftBackend::Cpu
+            );
         }
     }
 

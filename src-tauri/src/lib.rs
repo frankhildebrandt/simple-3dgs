@@ -19,7 +19,9 @@ mod html_export;
 mod keyframes;
 mod log_buffer;
 mod manifest;
+mod match_graph;
 mod pipeline;
+mod pipeline_plan;
 mod preset;
 mod project;
 mod settings;
@@ -49,7 +51,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::start_pipeline,
+            commands::plan_pipeline,
             commands::cancel_pipeline,
+            commands::set_preview_visibility,
             commands::get_config,
             commands::save_config,
             commands::list_archive,
@@ -71,6 +75,8 @@ pub fn run() {
             commands::list_project_frames,
             commands::get_sparse_preview,
             commands::pipeline_logs,
+            commands::list_pipeline_runs,
+            commands::pipeline_log_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

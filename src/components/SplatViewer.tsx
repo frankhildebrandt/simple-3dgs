@@ -28,6 +28,7 @@ type Props = {
   captureMode?: CaptureMode;
   viewer?: ViewerKnobs;
   live?: boolean;
+  active?: boolean;
   fullscreen?: boolean;
   onToggleFullscreen?: () => void;
   onSetPreview?: (jpegBase64: string) => void | Promise<void>;
@@ -153,6 +154,7 @@ export function SplatViewer({
   captureMode = "object",
   viewer,
   live,
+  active = true,
   fullscreen,
   onToggleFullscreen,
   onSetPreview,
@@ -169,8 +171,11 @@ export function SplatViewer({
   const [scale, setScale] = useState<ViewerScale>("fast");
   const [viewMode, setViewMode] = useState<ViewerMode>("splats");
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadProgress, setLoadProgress] = useState<{ loaded: number; total: number } | null>(null);
   const liveRef = useRef(!!live);
   liveRef.current = !!live;
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
   const viewModeRef = useRef(viewMode);
@@ -178,6 +183,10 @@ export function SplatViewer({
   const pendingPathRef = useRef<string | null>(null);
   const shownPathRef = useRef<string | null>(null);
   const loadingRef = useRef(false);
+  const lastLoadStartedRef = useRef(0);
+  const delayedLoadRef = useRef<number | null>(null);
+  const startRenderingRef = useRef<() => void>(() => {});
+  const stopRenderingRef = useRef<() => void>(() => {});
   const [flySpeed, setFlySpeed] = useState(
     () => (viewer ?? viewerKnobsFor(captureMode)).moveSpeed,
   );
@@ -349,6 +358,10 @@ export function SplatViewer({
     let frame = 0;
     let lastTime = performance.now();
     const animate = () => {
+      if (!activeRef.current || document.hidden) {
+        frame = 0;
+        return;
+      }
       frame = requestAnimationFrame(animate);
       const now = performance.now();
       const dt = (now - lastTime) / 1000;
@@ -365,10 +378,27 @@ export function SplatViewer({
       controls.update(camera);
       renderer.render(scene, camera);
     };
-    animate();
+    const startRendering = () => {
+      if (frame || !activeRef.current || document.hidden) {
+        return;
+      }
+      lastTime = performance.now();
+      frame = requestAnimationFrame(animate);
+    };
+    const stopRendering = () => {
+      if (frame) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
+    };
+    const onVisibility = () => document.hidden ? stopRendering() : startRendering();
+    startRenderingRef.current = startRendering;
+    stopRenderingRef.current = stopRendering;
+    document.addEventListener("visibilitychange", onVisibility);
+    startRendering();
 
     const onResize = () => {
-      if (!host.clientWidth || !host.clientHeight) {
+      if (!activeRef.current || !host.clientWidth || !host.clientHeight) {
         return;
       }
       camera.aspect = host.clientWidth / host.clientHeight;
@@ -380,6 +410,9 @@ export function SplatViewer({
 
     return () => {
       cancelAnimationFrame(frame);
+      document.removeEventListener("visibilitychange", onVisibility);
+      startRenderingRef.current = () => {};
+      stopRenderingRef.current = () => {};
       observer.disconnect();
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointermove", onPointerMove);
@@ -404,6 +437,22 @@ export function SplatViewer({
   }, []);
 
   useEffect(() => {
+    if (active) {
+      const host = hostRef.current;
+      const world = worldRef.current;
+      if (host && world && host.clientWidth && host.clientHeight) {
+        world.camera.aspect = host.clientWidth / host.clientHeight;
+        world.camera.updateProjectionMatrix();
+        world.renderer.setSize(host.clientWidth, host.clientHeight, false);
+      }
+      startRenderingRef.current();
+    } else {
+      stopRenderingRef.current();
+    }
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) return;
     hostRef.current?.focus();
     worldRef.current?.renderer.domElement.focus();
     const host = hostRef.current;
@@ -422,7 +471,7 @@ export function SplatViewer({
     syncSize();
     const frame = requestAnimationFrame(syncSize);
     return () => cancelAnimationFrame(frame);
-  }, [fullscreen]);
+  }, [active, fullscreen]);
 
   useEffect(() => {
     if (!ready) {
@@ -434,6 +483,10 @@ export function SplatViewer({
     pendingPathRef.current = plyPath;
     if (!plyPath) {
       setLoadError(null);
+      setLoadProgress(null);
+      return;
+    }
+    if (!active) {
       return;
     }
     void loadLatest();
@@ -448,7 +501,21 @@ export function SplatViewer({
       if (!path || path === shownPathRef.current) {
         return;
       }
+      const wait = liveRef.current
+        ? Math.max(0, 5_000 - (performance.now() - lastLoadStartedRef.current))
+        : 0;
+      if (wait > 0) {
+        if (delayedLoadRef.current === null) {
+          delayedLoadRef.current = window.setTimeout(() => {
+            delayedLoadRef.current = null;
+            void loadLatest();
+          }, wait);
+        }
+        return;
+      }
       loadingRef.current = true;
+      lastLoadStartedRef.current = performance.now();
+      setLoadProgress({ loaded: 0, total: 0 });
       const posePromise = loadViewPose(path);
       let next: SplatMesh | null = null;
       try {
@@ -462,13 +529,22 @@ export function SplatViewer({
           fileBytes: bytes,
           fileType: kind === "spz" ? SplatFileType.SPZ : SplatFileType.PLY,
           fileName: splatFileName(path),
+          onProgress: (event) => {
+            if (pendingPathRef.current === path) {
+              setLoadProgress({ loaded: event.loaded, total: event.total });
+            }
+          },
           ...splatLoadFlags(profile, liveRef.current),
         });
         next.quaternion.set(1, 0, 0, 0);
         world.scene.add(next);
         const mesh = await next.initialized;
         next = mesh;
-        if (worldRef.current !== world || pendingPathRef.current === null) {
+        if (
+          worldRef.current !== world ||
+          pendingPathRef.current !== path ||
+          (liveRef.current && !activeRef.current)
+        ) {
           dropSplat(mesh);
           return;
         }
@@ -486,6 +562,7 @@ export function SplatViewer({
         world.framed = true;
         setFramed(true);
         setLoadError(null);
+        setLoadProgress(null);
         if (previous && previous !== mesh) {
           dropSplat(previous);
         }
@@ -500,12 +577,18 @@ export function SplatViewer({
         setLoadError(splatLoadHint(err));
       } finally {
         loadingRef.current = false;
-        if (worldRef.current === world && pendingPathRef.current !== shownPathRef.current) {
+        if (activeRef.current && worldRef.current === world && pendingPathRef.current !== shownPathRef.current) {
           void loadLatest();
         }
       }
     }
-  }, [plyPath, ready]);
+    return () => {
+      if (delayedLoadRef.current !== null) {
+        window.clearTimeout(delayedLoadRef.current);
+        delayedLoadRef.current = null;
+      }
+    };
+  }, [plyPath, ready, active]);
 
   useEffect(() => {
     const world = worldRef.current;
@@ -570,6 +653,10 @@ export function SplatViewer({
 
   const hint = loadError
     ? loadError
+    : loadProgress
+      ? loadProgress.total > 0
+        ? `Loading preview — ${Math.round(loadProgress.loaded * 100 / loadProgress.total)}%`
+        : "Decoding preview…"
     : live
       ? "Live preview — Hold left mouse to look · WASD fly · Q up · E down · Y/C roll · Space start · Shift faster"
       : "Hold left mouse to look · WASD fly · Q up · E down · Y/C roll · Space start · Shift faster";

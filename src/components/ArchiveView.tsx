@@ -1,14 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { deleteArchive, import3dgs, listArchive, renameArchive } from "../api";
 import { closeSplatWindow, openSplatWindow } from "../splatWindows";
-import type { AppConfig, ArchiveEntry } from "../types";
+import type { AppConfig, ArchiveEntry, TaskProgress } from "../types";
 import { convertArchiveToSpz } from "../spzExport";
 import { ArchiveCard } from "./ArchiveCard";
-import { ArchiveDetail } from "./ArchiveDetail";
-import { ArchiveMap } from "./ArchiveMap";
 import { ArchiveMenu } from "./ArchiveMenu";
+
+const ArchiveDetail = lazy(() => import("./ArchiveDetail").then((module) => ({ default: module.ArchiveDetail })));
+const ArchiveMap = lazy(() => import("./ArchiveMap").then((module) => ({ default: module.ArchiveMap })));
 
 type Props = {
   config: AppConfig | null;
@@ -27,6 +28,8 @@ export function ArchiveView({ config }: Props) {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [task, setTask] = useState<TaskProgress | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const reload = useCallback(async () => {
     try {
@@ -60,6 +63,14 @@ export function ArchiveView({ config }: Props) {
     };
   }, [reload]);
 
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    void listen<TaskProgress>("task-progress", (event) => setTask(event.payload)).then((unlisten) => {
+      stop = unlisten;
+    });
+    return () => stop?.();
+  }, []);
+
   const selected = entries.find((entry) => entry.id === selectedId) ?? null;
   const menuEntry = menu ? entries.find((entry) => entry.id === menu.id) : null;
 
@@ -71,6 +82,8 @@ export function ArchiveView({ config }: Props) {
     if (typeof file !== "string") {
       return;
     }
+    setBusy(true);
+    setTask(null);
     try {
       const entry = await import3dgs(file);
       await reload();
@@ -78,6 +91,8 @@ export function ArchiveView({ config }: Props) {
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -113,12 +128,19 @@ export function ArchiveView({ config }: Props) {
     if (!ok) {
       return;
     }
+    setBusy(true);
+    const showPhase = (phase: string) => setTask({
+      taskId: "local", kind: "spz", phase, indeterminate: true, cancellable: false, status: "running",
+    });
+    showPhase("Preparing SPZ");
     try {
-      await convertArchiveToSpz(entry);
+      await convertArchiveToSpz(entry, showPhase);
       await reload();
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -151,13 +173,21 @@ export function ArchiveView({ config }: Props) {
           {config ? config.archiveDir : "No archive folder"}
         </p>
         <div className="row">
-          <button type="button" className="primary" onClick={() => void onImport()}>
-            Import .3dgs
+          <button type="button" className="primary" disabled={busy} onClick={() => void onImport()}>
+            {busy ? "Importing…" : "Import .3dgs"}
           </button>
         </div>
+        {busy && task ? (
+          <div className="task-progress" role="status">
+            <span>{task.phase}</span>
+            {task.indeterminate || !task.totalBytes ? <progress /> : <progress max={task.totalBytes} value={task.currentBytes ?? 0} />}
+          </div>
+        ) : null}
         {error ? <p className="archive-error">{error}</p> : null}
       </header>
-      <ArchiveMap entries={entries} selectedId={selectedId} onSelect={setSelectedId} />
+      <Suspense fallback={<section className="archive-map"><p className="archive-map-empty">Loading map…</p></section>}>
+        <ArchiveMap entries={entries} selectedId={selectedId} onSelect={setSelectedId} />
+      </Suspense>
       <div className="archive-split">
         <div className="archive-cards">
           {entries.length === 0 ? (
@@ -182,7 +212,9 @@ export function ArchiveView({ config }: Props) {
           )}
         </div>
         {selected ? (
-          <ArchiveDetail entry={selected} onClose={() => setSelectedId(null)} onPoster={() => void reload()} />
+          <Suspense fallback={<p className="archive-empty">Loading viewer…</p>}>
+            <ArchiveDetail entry={selected} onClose={() => setSelectedId(null)} onPoster={() => void reload()} />
+          </Suspense>
         ) : (
           <p className="archive-empty">Select a card or map marker to open the viewer.</p>
         )}

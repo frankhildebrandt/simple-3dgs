@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getArchive, setArchivePoster } from "../api";
 import { toggleNativeFullscreen, watchNativeFullscreen } from "../fullscreen";
 import type { ArchiveEntry } from "../types";
-import { SplatViewer } from "./SplatViewer";
+
+const SplatViewer = lazy(() => import("./SplatViewer").then((module) => ({ default: module.SplatViewer })));
 
 type Props = {
   splatId: string;
@@ -98,19 +99,21 @@ export function SplatWindow({ splatId }: Props) {
 
   return (
     <div className={fullscreen ? "shell viewer-fullscreen splat-window" : "shell splat-window"}>
-      <SplatViewer
-        key={`${entry.id}:${entry.plyPath}`}
-        plyPath={entry.plyPath}
-        captureMode={entry.settings?.captureMode ?? "object"}
-        viewer={entry.settings?.viewer}
-        fullscreen={fullscreen}
-        onToggleFullscreen={() => {
-          void toggleNativeFullscreen().then(setFullscreen);
-        }}
-        onSetPreview={async (jpegBase64) => {
-          await setArchivePoster(entry.id, jpegBase64);
-        }}
-      />
+      <Suspense fallback={<p className="archive-empty">Loading 3D viewer…</p>}>
+        <SplatViewer
+          key={`${entry.id}:${entry.plyPath}`}
+          plyPath={entry.plyPath}
+          captureMode={entry.settings?.captureMode ?? "object"}
+          viewer={entry.settings?.viewer}
+          fullscreen={fullscreen}
+          onToggleFullscreen={() => {
+            void toggleNativeFullscreen().then(setFullscreen);
+          }}
+          onSetPreview={async (jpegBase64) => {
+            await setArchivePoster(entry.id, jpegBase64);
+          }}
+        />
+      </Suspense>
     </div>
   );
 }

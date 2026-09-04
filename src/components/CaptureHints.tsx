@@ -1,6 +1,6 @@
-import { useEffect } from "react";
 import { captureTips } from "../captureTips";
 import type { CaptureMode } from "../types";
+import { useDialogFocus } from "../useDialogFocus";
 
 type Props = {
   mode: CaptureMode;
@@ -10,18 +10,7 @@ type Props = {
 
 /** Overlay with mode-specific filming advice. */
 export function CaptureHints({ mode, open, onClose }: Props) {
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  const dialogRef = useDialogFocus(open, onClose);
 
   if (!open) {
     return null;
@@ -32,6 +21,7 @@ export function CaptureHints({ mode, open, onClose }: Props) {
   return (
     <div className="dialog-backdrop" onClick={onClose}>
       <div
+        ref={dialogRef}
         className="dialog"
         role="dialog"
         aria-modal="true"

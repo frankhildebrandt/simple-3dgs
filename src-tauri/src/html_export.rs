@@ -454,7 +454,10 @@ mod tests {
         assert!(html.contains("behindFoveate: 0.1"));
         assert!(html.contains("coneFoveate: 0.4"));
         assert!(html.contains("clipXY: 1.2"));
-        assert!(html.contains(&format!("minAlpha: {:.8}", crate::viewer_knobs::ROOM_MIN_ALPHA)));
+        assert!(html.contains(&format!(
+            "minAlpha: {:.8}",
+            crate::viewer_knobs::ROOM_MIN_ALPHA
+        )));
         assert!(html.contains("controls.fpsMovement.moveSpeed = 0.5"));
     }
 

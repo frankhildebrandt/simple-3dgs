@@ -1,9 +1,11 @@
 //! Tauri IPC: pipeline, archive library, and app config.
 
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -18,6 +20,7 @@ use crate::html_export;
 use crate::log_buffer::LogBuffer;
 use crate::manifest::{self, ProjectManifest};
 use crate::pipeline::{InputKind, PipelineConfig, PipelineEvents};
+use crate::pipeline_plan::{self, PipelinePlan};
 use crate::project::{self, ProjectLayout, Stage};
 use crate::settings::PipelineSettings;
 use crate::sidecar::{CancelFlag, ProcessRunner};
@@ -29,6 +32,7 @@ pub struct AppState {
     pub cancel: CancelFlag,
     pub running: Mutex<bool>,
     pub logs: Mutex<LogBuffer>,
+    pub preview_visible: AtomicBool,
 }
 
 impl AppState {
@@ -37,6 +41,7 @@ impl AppState {
             cancel: CancelFlag::new(),
             running: Mutex::new(false),
             logs: Mutex::new(LogBuffer::new()),
+            preview_visible: AtomicBool::new(true),
         }
     }
 }
@@ -63,6 +68,8 @@ pub struct StartPipelineRequest {
     #[serde(default)]
     pub settings: PipelineSettings,
     pub force: bool,
+    #[serde(default)]
+    pub restart: bool,
     #[serde(default = "default_until")]
     pub until: String,
 }
@@ -110,10 +117,27 @@ pub struct ProjectFrame {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProgressPayload {
+pub struct ProgressPayloadV2 {
+    pub run_id: String,
+    pub sequence: u64,
+    pub status: String,
     pub stage: String,
-    pub percent: u8,
+    pub phase: String,
+    pub attempt: Option<u32>,
+    pub strategy: Option<String>,
+    pub stage_percent: u8,
+    pub phase_percent: u8,
+    pub current: Option<u32>,
+    pub total: Option<u32>,
+    pub elapsed_secs: u64,
+    pub eta_secs: Option<u64>,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames: Option<FrameSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cameras: Option<CameraSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train: Option<TrainSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,20 +150,253 @@ pub struct RunResult {
     pub project_dir: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProgressPayload {
+    pub task_id: String,
+    pub kind: String,
+    pub phase: String,
+    pub current_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub indeterminate: bool,
+    pub cancellable: bool,
+    pub status: String,
+}
+
+fn emit_task_progress(
+    app: &AppHandle,
+    task_id: &str,
+    kind: &str,
+    phase: &str,
+    current_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    indeterminate: bool,
+    status: &str,
+) {
+    let _ = app.emit(
+        "task-progress",
+        TaskProgressPayload {
+            task_id: task_id.into(),
+            kind: kind.into(),
+            phase: phase.into(),
+            current_bytes,
+            total_bytes,
+            indeterminate,
+            cancellable: false,
+            status: status.into(),
+        },
+    );
+}
+
+fn task_update_due(last: &mut Option<Instant>, current: u64, total: u64) -> bool {
+    let now = Instant::now();
+    if current >= total
+        || last.map_or(true, |previous| {
+            now.duration_since(previous) >= Duration::from_millis(100)
+        })
+    {
+        *last = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
 struct TauriEvents {
     app: AppHandle,
+    run_id: String,
+    sequence: u64,
+    stage_max: [u8; 3],
+    current_stage: Option<Stage>,
+    started: Instant,
+    last_progress_emit: Option<Instant>,
+    phase: String,
+    current: Option<u32>,
+    total: Option<u32>,
+    eta_secs: Option<u64>,
+    attempt: Option<u32>,
+    strategy: Option<String>,
+    writer: Option<BufWriter<fs::File>>,
+    last_file_flush: Instant,
+    finished: bool,
+    frame_stats: Option<FrameSnapshot>,
+    camera_stats: Option<CameraSnapshot>,
+    train_stats: Option<TrainSnapshot>,
+}
+
+impl TauriEvents {
+    fn new(app: AppHandle) -> Self {
+        Self {
+            app,
+            run_id: uuid::Uuid::new_v4().to_string(),
+            sequence: 0,
+            stage_max: [0; 3],
+            current_stage: None,
+            started: Instant::now(),
+            last_progress_emit: None,
+            phase: "prepare".into(),
+            current: None,
+            total: None,
+            eta_secs: None,
+            attempt: None,
+            strategy: None,
+            writer: None,
+            last_file_flush: Instant::now(),
+            finished: false,
+            frame_stats: None,
+            camera_stats: None,
+            train_stats: None,
+        }
+    }
+
+    fn write_record(&mut self, value: serde_json::Value) {
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        if serde_json::to_writer(&mut *writer, &value).is_ok() {
+            let _ = writer.write_all(b"\n");
+            if self.last_file_flush.elapsed() >= Duration::from_millis(250) {
+                let _ = writer.flush();
+                self.last_file_flush = Instant::now();
+            }
+        }
+    }
+}
+
+fn monotonic_stage_percent(maxima: &mut [u8; 3], stage: Stage, percent: u8) -> u8 {
+    let index = match stage {
+        Stage::Frames => 0,
+        Stage::Colmap => 1,
+        Stage::Train => 2,
+    };
+    maxima[index] = maxima[index].max(percent.min(100));
+    maxima[index]
+}
+
+fn open_run_writer(project_dir: &Path, run_id: &str) -> Option<BufWriter<fs::File>> {
+    let dir = project_dir.join("runs");
+    fs::create_dir_all(&dir).ok()?;
+    let mut existing = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .collect::<Vec<_>>();
+    existing.sort();
+    for path in existing.into_iter().rev().skip(9) {
+        let _ = fs::remove_file(path);
+    }
+    let filename = format!("{}-{run_id}.jsonl", chrono::Utc::now().timestamp_millis());
+    fs::File::create(dir.join(filename))
+        .ok()
+        .map(BufWriter::new)
 }
 
 impl PipelineEvents for TauriEvents {
-    fn progress(&mut self, stage: Stage, percent: u8, message: &str) {
-        let _ = self.app.emit(
-            "pipeline-progress",
-            ProgressPayload {
+    fn begin_run(&mut self, project_dir: &Path) {
+        self.writer = open_run_writer(project_dir, &self.run_id);
+        self.write_record(serde_json::json!({
+            "kind": "run",
+            "runId": self.run_id,
+            "status": "running",
+            "at": chrono::Utc::now().to_rfc3339(),
+        }));
+        if let Some(writer) = self.writer.as_mut() {
+            let _ = writer.flush();
+        }
+    }
+
+    fn finish_run(&mut self, status: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if status != "complete" {
+            let stage = self.current_stage.unwrap_or(Stage::Frames);
+            self.sequence += 1;
+            let payload = ProgressPayloadV2 {
+                run_id: self.run_id.clone(),
+                sequence: self.sequence,
+                status: status.into(),
                 stage: stage.as_str().into(),
-                percent,
-                message: message.into(),
-            },
-        );
+                phase: self.phase.clone(),
+                attempt: self.attempt,
+                strategy: self.strategy.clone(),
+                stage_percent: monotonic_stage_percent(&mut self.stage_max, stage, 0),
+                phase_percent: 0,
+                current: self.current,
+                total: self.total,
+                elapsed_secs: self.started.elapsed().as_secs(),
+                eta_secs: self.eta_secs,
+                message: status.into(),
+                frames: self.frame_stats.clone(),
+                cameras: self.camera_stats.clone(),
+                train: self.train_stats.clone(),
+            };
+            let _ = self.app.emit("pipeline-progress-v2", &payload);
+            self.write_record(serde_json::json!({ "kind": "progress", "event": payload }));
+        }
+        self.write_record(serde_json::json!({
+            "kind": "run",
+            "runId": self.run_id,
+            "status": status,
+            "elapsedSecs": self.started.elapsed().as_secs(),
+            "at": chrono::Utc::now().to_rfc3339(),
+        }));
+        if let Some(writer) = self.writer.as_mut() {
+            let _ = writer.flush();
+        }
+    }
+
+    fn progress(&mut self, stage: Stage, percent: u8, message: &str) {
+        if self.current_stage != Some(stage) {
+            self.current_stage = Some(stage);
+            self.phase = "prepare".into();
+            self.current = None;
+            self.total = None;
+            self.eta_secs = None;
+            self.attempt = None;
+            self.strategy = None;
+        }
+        let phase_percent = percent.min(100);
+        let stage_percent = monotonic_stage_percent(&mut self.stage_max, stage, phase_percent);
+        let now = Instant::now();
+        let urgent = stage_percent == 100
+            || self.last_progress_emit.is_none()
+            || self
+                .last_progress_emit
+                .is_some_and(|last| now.duration_since(last) >= Duration::from_millis(100));
+        if !urgent {
+            return;
+        }
+        self.last_progress_emit = Some(now);
+        self.sequence += 1;
+        let payload_v2 = ProgressPayloadV2 {
+            run_id: self.run_id.clone(),
+            sequence: self.sequence,
+            status: if stage_percent == 100 {
+                "complete"
+            } else {
+                "running"
+            }
+            .into(),
+            stage: stage.as_str().into(),
+            phase: self.phase.clone(),
+            attempt: self.attempt,
+            strategy: self.strategy.clone(),
+            stage_percent,
+            phase_percent,
+            current: self.current,
+            total: self.total,
+            elapsed_secs: self.started.elapsed().as_secs(),
+            eta_secs: self.eta_secs,
+            message: message.into(),
+            frames: self.frame_stats.clone(),
+            cameras: self.camera_stats.clone(),
+            train: self.train_stats.clone(),
+        };
+        let _ = self.app.emit("pipeline-progress-v2", &payload_v2);
+        self.write_record(serde_json::json!({ "kind": "progress", "event": payload_v2 }));
     }
 
     fn log(&mut self, line: &str) {
@@ -148,28 +405,70 @@ impl PipelineEvents for TauriEvents {
                 logs.push(line);
             }
         }
+        self.write_record(serde_json::json!({
+            "kind": "log",
+            "runId": self.run_id,
+            "elapsedSecs": self.started.elapsed().as_secs_f32(),
+            "line": line,
+        }));
         let _ = self.app.emit("pipeline-log", line.to_string());
     }
 
     fn preview(&mut self, path: &Path) {
+        if self
+            .app
+            .try_state::<AppState>()
+            .is_some_and(|state| !state.preview_visible.load(Ordering::Relaxed))
+        {
+            return;
+        }
         let _ = self
             .app
             .emit("pipeline-preview", path.to_string_lossy().into_owned());
     }
 
     fn train_stats(&mut self, stats: &TrainSnapshot) {
-        let _ = self.app.emit("pipeline-train-stats", stats);
+        self.current_stage = Some(Stage::Train);
+        self.phase = if stats.iter.is_some() {
+            "training"
+        } else {
+            "load-dataset"
+        }
+        .into();
+        self.current = stats.iter;
+        self.total = Some(stats.total);
+        self.eta_secs = stats.eta_secs;
+        self.train_stats = Some(stats.clone());
     }
 
     fn frame_stats(&mut self, stats: &FrameSnapshot) {
-        let _ = self.app.emit("pipeline-frame-stats", stats);
+        self.current_stage = Some(Stage::Frames);
+        self.phase = format!("{:?}", stats.pass).to_lowercase();
+        self.current = stats.current;
+        self.total = stats.total;
+        self.eta_secs = stats.eta_secs;
+        self.frame_stats = Some(stats.clone());
     }
 
     fn camera_stats(&mut self, stats: &CameraSnapshot) {
-        let _ = self.app.emit("pipeline-camera-stats", stats);
+        self.current_stage = Some(Stage::Colmap);
+        self.phase = format!("{:?}", stats.step).to_lowercase();
+        self.current = stats.registered.or(stats.processed);
+        self.total = stats.total;
+        self.eta_secs = stats.eta_secs;
+        self.attempt = stats.attempt.or(stats.trying);
+        self.strategy = stats.strategy.clone();
+        self.camera_stats = Some(stats.clone());
     }
 
     fn frame_preview(&mut self, path: &Path) {
+        if self
+            .app
+            .try_state::<AppState>()
+            .is_some_and(|state| !state.preview_visible.load(Ordering::Relaxed))
+        {
+            return;
+        }
         let _ = self.app.emit(
             "pipeline-frame-preview",
             path.to_string_lossy().into_owned(),
@@ -177,7 +476,20 @@ impl PipelineEvents for TauriEvents {
     }
 
     fn sparse_preview(&mut self, preview: &SparsePreview) {
+        if self
+            .app
+            .try_state::<AppState>()
+            .is_some_and(|state| !state.preview_visible.load(Ordering::Relaxed))
+        {
+            return;
+        }
         let _ = self.app.emit("pipeline-sparse", preview);
+    }
+
+    fn wants_preview(&self) -> bool {
+        self.app
+            .try_state::<AppState>()
+            .map_or(true, |state| state.preview_visible.load(Ordering::Relaxed))
     }
 }
 
@@ -219,6 +531,7 @@ pub async fn start_pipeline(
         kind,
         settings: request.settings.sanitized(),
         force: request.force,
+        restart: request.restart,
         until: parse_until(&request.until),
     };
     let cancel = state.cancel.clone();
@@ -226,8 +539,14 @@ pub async fn start_pipeline(
 
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mut runner = ProcessRunner::new(cancel.clone());
-        let mut events = TauriEvents { app: worker_app };
-        crate::pipeline::run_pipeline(&config, &mut runner, &cancel, &mut events)
+        let mut events = TauriEvents::new(worker_app);
+        let result = crate::pipeline::run_pipeline(&config, &mut runner, &cancel, &mut events);
+        events.finish_run(match &result {
+            Ok(_) => "complete",
+            Err(PipelineError::Cancelled) => "cancelled",
+            Err(_) => "error",
+        });
+        result
     })
     .await
     .map_err(|err| err.to_string())?;
@@ -264,10 +583,60 @@ pub async fn start_pipeline(
     }
 }
 
+/// Computes the exact reuse/invalidation decision without changing project files.
+#[tauri::command]
+pub fn plan_pipeline(request: StartPipelineRequest) -> Result<PipelinePlan, String> {
+    let kind = match request.source_kind.as_str() {
+        "images" => InputKind::Images,
+        _ => InputKind::Video,
+    };
+    let source = PathBuf::from(request.source_path);
+    let settings = request.settings.sanitized();
+    let expected = pipeline_plan::fingerprints(
+        &source,
+        match kind {
+            InputKind::Images => "images",
+            InputKind::Video => "video",
+        },
+        settings,
+    )
+    .map_err(|err| err.to_string())?;
+    let Some(project_dir) = request.project_dir.filter(|value| !value.is_empty()) else {
+        return Ok(pipeline_plan::fresh(expected));
+    };
+    let layout = ProjectLayout::new(PathBuf::from(project_dir));
+    let manifest = ProjectManifest::load(&manifest::project_file(layout.root())).ok();
+    if manifest.as_ref().is_some_and(|saved| {
+        let saved_path = Path::new(&saved.source_path);
+        saved_path.canonicalize().ok() != source.canonicalize().ok() && saved_path != source
+    }) {
+        return Err(
+            "This project belongs to a different source. Create a new project for the new capture."
+                .into(),
+        );
+    }
+    pipeline_plan::build(
+        &layout,
+        manifest.as_ref(),
+        &source,
+        match kind {
+            InputKind::Images => "images",
+            InputKind::Video => "video",
+        },
+        settings,
+    )
+    .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub fn cancel_pipeline(state: State<'_, AppState>) -> Result<(), String> {
     state.cancel.cancel();
     Ok(())
+}
+
+#[tauri::command]
+pub fn set_preview_visibility(state: State<'_, AppState>, visible: bool) {
+    state.preview_visible.store(visible, Ordering::Relaxed);
 }
 
 /// Snapshot of the current reconstruction log for the dedicated log window.
@@ -275,6 +644,94 @@ pub fn cancel_pipeline(state: State<'_, AppState>) -> Result<(), String> {
 pub fn pipeline_logs(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let logs = state.logs.lock().map_err(|err| err.to_string())?;
     Ok(logs.snapshot())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineRunSummary {
+    pub run_id: String,
+    pub modified_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineLogPage {
+    pub lines: Vec<String>,
+    pub next_before: Option<usize>,
+}
+
+#[tauri::command]
+pub fn list_pipeline_runs(project_dir: String) -> Result<Vec<PipelineRunSummary>, String> {
+    let dir = PathBuf::from(project_dir).join("runs");
+    let mut runs = fs::read_dir(&dir)
+        .map_err(|err| PipelineError::from_io_path(err, &dir).to_string())?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            let run_id = name.split_once('-')?.1.strip_suffix(".jsonl")?;
+            uuid::Uuid::parse_str(run_id).ok()?;
+            let modified_ms = entry
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis();
+            Some(PipelineRunSummary {
+                run_id: run_id.into(),
+                modified_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    runs.sort_by_key(|run| std::cmp::Reverse(run.modified_ms));
+    runs.truncate(10);
+    Ok(runs)
+}
+
+#[tauri::command]
+pub fn pipeline_log_page(
+    project_dir: String,
+    run_id: String,
+    before: Option<usize>,
+    limit: Option<usize>,
+) -> Result<PipelineLogPage, String> {
+    uuid::Uuid::parse_str(&run_id).map_err(|_| "Invalid run id".to_string())?;
+    let dir = PathBuf::from(project_dir).join("runs");
+    let suffix = format!("-{run_id}.jsonl");
+    let path = fs::read_dir(&dir)
+        .map_err(|err| PipelineError::from_io_path(err, &dir).to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&suffix))
+        })
+        .ok_or_else(|| "Run log not found".to_string())?;
+    let lines = BufReader::new(fs::File::open(&path).map_err(|err| err.to_string())?)
+        .lines()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    let end = before.unwrap_or(lines.len()).min(lines.len());
+    let limit = limit.unwrap_or(250).clamp(1, 500);
+    let start = end.saturating_sub(limit);
+    let page = lines[start..end]
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value.get("kind").and_then(|kind| kind.as_str()) == Some("log"))
+        .filter_map(|value| {
+            value
+                .get("line")
+                .and_then(|line| line.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    Ok(PipelineLogPage {
+        lines: page,
+        next_before: (start > 0).then_some(start),
+    })
 }
 
 #[tauri::command]
@@ -366,16 +823,102 @@ pub fn set_archive_poster(
 
 #[tauri::command]
 pub fn import_3dgs(app: AppHandle, path: String) -> Result<ArchiveEntry, String> {
-    library(&app)?
-        .import_3dgs(Path::new(&path))
-        .map_err(|err| err.to_string())
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let total = fs::metadata(&path).ok().map(|meta| meta.len());
+    emit_task_progress(
+        &app,
+        &task_id,
+        "import-3dgs",
+        "Read archive",
+        Some(0),
+        total,
+        false,
+        "running",
+    );
+    emit_task_progress(
+        &app,
+        &task_id,
+        "import-3dgs",
+        "Unpack and verify",
+        None,
+        total,
+        true,
+        "running",
+    );
+    let mut last_update = None;
+    let result = library(&app)?
+        .import_3dgs_with_progress(Path::new(&path), &mut |phase, current, total| {
+            if !task_update_due(&mut last_update, current, total) {
+                return;
+            }
+            emit_task_progress(
+                &app,
+                &task_id,
+                "import-3dgs",
+                phase,
+                Some(current),
+                Some(total),
+                false,
+                "running",
+            );
+        })
+        .map_err(|err| err.to_string());
+    emit_task_progress(
+        &app,
+        &task_id,
+        "import-3dgs",
+        "Finish",
+        total,
+        total,
+        false,
+        if result.is_ok() { "complete" } else { "error" },
+    );
+    result
 }
 
 #[tauri::command]
 pub fn export_3dgs(app: AppHandle, id: String, dest_path: String) -> Result<(), String> {
-    library(&app)?
-        .export_3dgs(&id, Path::new(&dest_path))
-        .map_err(|err| err.to_string())
+    let task_id = uuid::Uuid::new_v4().to_string();
+    emit_task_progress(
+        &app,
+        &task_id,
+        "export-3dgs",
+        "Pack archive",
+        None,
+        None,
+        true,
+        "running",
+    );
+    let mut last_update = None;
+    let result = library(&app)?
+        .export_3dgs_with_progress(&id, Path::new(&dest_path), &mut |phase, current, total| {
+            if !task_update_due(&mut last_update, current, total) {
+                return;
+            }
+            emit_task_progress(
+                &app,
+                &task_id,
+                "export-3dgs",
+                phase,
+                Some(current),
+                Some(total),
+                false,
+                "running",
+            );
+        })
+        .map_err(|err| err.to_string());
+    let total = fs::metadata(&dest_path).ok().map(|meta| meta.len());
+    emit_task_progress(
+        &app,
+        &task_id,
+        "export-3dgs",
+        "Write archive",
+        total,
+        total,
+        false,
+        if result.is_ok() { "complete" } else { "error" },
+    );
+    result
 }
 
 #[tauri::command]
@@ -408,16 +951,83 @@ pub fn cache_archive_spz(app: AppHandle, request: Request<'_>) -> Result<(), Str
             return Err("SPZ cache expects a binary payload.".into());
         }
     };
-    library(&app)?
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let total = Some(bytes.len() as u64);
+    emit_task_progress(
+        &app,
+        &task_id,
+        "spz",
+        "Write SPZ",
+        Some(0),
+        total,
+        false,
+        "running",
+    );
+    let result = library(&app)?
         .write_spz(&id, bytes)
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string());
+    emit_task_progress(
+        &app,
+        &task_id,
+        "spz",
+        "Write SPZ",
+        total,
+        total,
+        false,
+        if result.is_ok() { "complete" } else { "error" },
+    );
+    result
 }
 
 #[tauri::command]
 pub fn export_spz(app: AppHandle, id: String, dest_path: String) -> Result<(), String> {
-    library(&app)?
-        .export_spz(&id, Path::new(&dest_path))
-        .map_err(|err| err.to_string())
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let lib = library(&app)?;
+    let total = lib
+        .get(&id)
+        .ok()
+        .and_then(|entry| fs::metadata(Path::new(&entry.dir).join("scene.spz")).ok())
+        .map(|meta| meta.len());
+    emit_task_progress(
+        &app,
+        &task_id,
+        "export-spz",
+        "Copy SPZ",
+        Some(0),
+        total,
+        false,
+        "running",
+    );
+    let mut last_update = None;
+    let result = lib
+        .export_spz_with_progress(&id, Path::new(&dest_path), &mut |current, total| {
+            if !task_update_due(&mut last_update, current, total) {
+                return;
+            }
+            emit_task_progress(
+                &app,
+                &task_id,
+                "export-spz",
+                "Copy SPZ",
+                Some(current),
+                Some(total),
+                false,
+                "running",
+            );
+        })
+        .map_err(|err| err.to_string());
+    let written = fs::metadata(&dest_path).ok().map(|meta| meta.len());
+    emit_task_progress(
+        &app,
+        &task_id,
+        "export-spz",
+        "Finish",
+        written,
+        written.or(total),
+        false,
+        if result.is_ok() { "complete" } else { "error" },
+    );
+    result
 }
 
 /// Reads a local PLY or SPZ as a raw IPC body so the viewer can skip `asset:` fetch.
@@ -669,6 +1279,33 @@ fn emit_archive_changed(app: &AppHandle, id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_percent_never_moves_back_during_retries() {
+        let mut maxima = [0; 3];
+        assert_eq!(monotonic_stage_percent(&mut maxima, Stage::Colmap, 70), 70);
+        assert_eq!(monotonic_stage_percent(&mut maxima, Stage::Colmap, 55), 70);
+        assert_eq!(monotonic_stage_percent(&mut maxima, Stage::Frames, 40), 40);
+        assert_eq!(
+            monotonic_stage_percent(&mut maxima, Stage::Colmap, 101),
+            100
+        );
+    }
+
+    #[test]
+    fn run_logs_rotate_to_ten_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        for index in 0..12 {
+            fs::write(runs.join(format!("{index:03}-old.jsonl")), b"{}\n").unwrap();
+        }
+        drop(open_run_writer(
+            dir.path(),
+            &uuid::Uuid::new_v4().to_string(),
+        ));
+        assert_eq!(fs::read_dir(runs).unwrap().count(), 10);
+    }
 
     #[test]
     fn read_splat_bytes_rejects_missing_and_empty_files() {

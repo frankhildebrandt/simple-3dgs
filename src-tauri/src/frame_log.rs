@@ -8,6 +8,7 @@ use crate::duration::{eta_secs, format_duration, parse_ffmpeg_duration, parse_hm
 #[serde(rename_all = "lowercase")]
 pub enum FramePass {
     Candidates,
+    Scoring,
     Keyframes,
     Import,
 }
@@ -124,6 +125,7 @@ impl FrameSnapshot {
         };
         match self.pass {
             FramePass::Candidates => (u16::from(fraction) * 50 / 100) as u8,
+            FramePass::Scoring => 50 + (u16::from(fraction) * 20 / 100) as u8,
             FramePass::Keyframes => 50 + (u16::from(fraction) * 50 / 100) as u8,
             FramePass::Import => fraction.max(5),
         }
@@ -134,6 +136,7 @@ impl FrameSnapshot {
         let mut parts = Vec::new();
         parts.push(match self.pass {
             FramePass::Candidates => "Candidate frames".into(),
+            FramePass::Scoring => "Scoring frames".into(),
             FramePass::Keyframes => "Extracting keyframes".into(),
             FramePass::Import => "Importing stills".into(),
         });

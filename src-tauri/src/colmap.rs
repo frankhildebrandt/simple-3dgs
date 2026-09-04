@@ -1,6 +1,8 @@
 //! COLMAP SfM command sequence. Matcher and mapper come from settings knobs;
 //! named presets still fill those from capture mode. Exhaustive matching falls
 //! back to sequential when the frame count exceeds `exhaustiveFrameLimit`.
+//! After the first matcher, a weak match graph rematches with wider sequential
+//! overlap, transitive pairs, then exhaustive (when under the frame limit).
 //! Flags match COLMAP 4 (`FeatureExtraction` / `FeatureMatching`, not the old `SiftExtraction.use_gpu`).
 
 use std::path::{Path, PathBuf};
@@ -26,18 +28,59 @@ pub fn reconstruction_specs(
 ) -> Vec<CommandSpec> {
     let settings = settings.sanitized();
     let mode = settings.capture_mode;
-    let knobs = settings.colmap_knobs();
     let mut specs = vec![
         feature_extractor_spec(image_dir, database, settings, image_list).capture(mode),
         matcher_spec(database, settings, frame_count).capture(mode),
     ];
-    if knobs.mapper == ColmapMapper::Global {
-        specs.push(view_graph_calibrator_spec(global_database).capture(mode));
-        specs.push(global_mapper_spec(image_dir, global_database, sparse_dir).capture(mode));
-    } else {
-        specs.push(mapper_spec(image_dir, database, sparse_dir, settings).capture(mode));
-    }
+    specs.extend(mapping_specs(
+        image_dir,
+        database,
+        sparse_dir,
+        settings,
+        global_database,
+    ));
     specs
+}
+
+/// Calibrator plus global mapper, or incremental mapper, from knobs.
+pub fn mapping_specs(
+    image_dir: &Path,
+    database: &Path,
+    sparse_dir: &Path,
+    settings: PipelineSettings,
+    global_database: &Path,
+) -> Vec<CommandSpec> {
+    let settings = settings.sanitized();
+    let mode = settings.capture_mode;
+    let knobs = settings.colmap_knobs();
+    if knobs.mapper == ColmapMapper::Global {
+        vec![
+            view_graph_calibrator_spec(global_database).capture(mode),
+            global_mapper_spec(image_dir, global_database, sparse_dir).capture(mode),
+        ]
+    } else {
+        vec![mapper_spec(image_dir, database, sparse_dir, settings).capture(mode)]
+    }
+}
+
+/// Rematch steps after the first matcher, cheapest first. Exhaustive is skipped above the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchEscalate {
+    WiderSequential,
+    Transitive,
+    Exhaustive,
+}
+
+impl MatchEscalate {
+    pub const ALL: [Self; 3] = [Self::WiderSequential, Self::Transitive, Self::Exhaustive];
+
+    pub fn log_line(self) -> &'static str {
+        match self {
+            Self::WiderSequential => "Matching was sparse, expanding overlap",
+            Self::Transitive => "Matching still sparse, trying transitive pairs",
+            Self::Exhaustive => "Matching still sparse, trying exhaustive pairs",
+        }
+    }
 }
 
 pub fn feature_extractor_spec(
@@ -113,15 +156,54 @@ pub fn matcher_spec(
 
 pub fn sequential_matcher_spec(database: &Path, settings: PipelineSettings) -> CommandSpec {
     let knobs = settings.colmap_knobs();
+    sequential_matcher_args(
+        database,
+        settings,
+        sequential_overlap(settings),
+        knobs.quadratic_overlap,
+        false,
+    )
+}
+
+/// Next rematch command. `None` when exhaustive would exceed the frame limit.
+pub fn escalate_matcher_spec(
+    database: &Path,
+    settings: PipelineSettings,
+    frame_count: usize,
+    step: MatchEscalate,
+) -> Option<CommandSpec> {
+    let settings = settings.sanitized();
+    let spec = match step {
+        MatchEscalate::WiderSequential => {
+            sequential_matcher_args(database, settings, escalate_overlap(settings), true, true)
+        }
+        MatchEscalate::Transitive => transitive_matcher_spec(database, settings),
+        MatchEscalate::Exhaustive => {
+            if frame_count > settings.colmap_knobs().exhaustive_frame_limit as usize {
+                return None;
+            }
+            exhaustive_matcher_args(database, settings, true)
+        }
+    };
+    Some(spec.capture(settings.capture_mode))
+}
+
+fn sequential_matcher_args(
+    database: &Path,
+    settings: PipelineSettings,
+    overlap: u32,
+    quadratic: bool,
+    guided: bool,
+) -> CommandSpec {
     let mut args = vec![
         "sequential_matcher".into(),
         "--database_path".into(),
         path_arg(database),
     ];
-    args.extend(matching_flags(knobs.sift_backend));
+    args.extend(matching_flags(settings.colmap_knobs().sift_backend, guided));
     args.push("--SequentialMatching.overlap".into());
-    args.push(sequential_overlap(settings).to_string());
-    if knobs.quadratic_overlap {
+    args.push(overlap.to_string());
+    if quadratic {
         args.push("--SequentialMatching.quadratic_overlap".into());
         args.push("1".into());
     }
@@ -129,12 +211,30 @@ pub fn sequential_matcher_spec(database: &Path, settings: PipelineSettings) -> C
 }
 
 pub fn exhaustive_matcher_spec(database: &Path, settings: PipelineSettings) -> CommandSpec {
+    exhaustive_matcher_args(database, settings, false)
+}
+
+fn exhaustive_matcher_args(
+    database: &Path,
+    settings: PipelineSettings,
+    guided: bool,
+) -> CommandSpec {
     let mut args = vec![
         "exhaustive_matcher".into(),
         "--database_path".into(),
         path_arg(database),
     ];
-    args.extend(matching_flags(settings.colmap_knobs().sift_backend));
+    args.extend(matching_flags(settings.colmap_knobs().sift_backend, guided));
+    CommandSpec::new("colmap", args)
+}
+
+pub fn transitive_matcher_spec(database: &Path, settings: PipelineSettings) -> CommandSpec {
+    let mut args = vec![
+        "transitive_matcher".into(),
+        "--database_path".into(),
+        path_arg(database),
+    ];
+    args.extend(matching_flags(settings.colmap_knobs().sift_backend, true));
     CommandSpec::new("colmap", args)
 }
 
@@ -159,8 +259,8 @@ fn extraction_flags(sift: SiftBackend) -> Vec<String> {
 
 /// Metal matching uses the SiftMetal GPU kernel. CPU matching skips FAISS:
 /// Homebrew FAISS 1.15 headers vs bundled FAISS shift the Index vtable.
-fn matching_flags(sift: SiftBackend) -> Vec<String> {
-    match sift {
+fn matching_flags(sift: SiftBackend, guided: bool) -> Vec<String> {
+    let mut flags = match sift {
         SiftBackend::Metal => vec![
             "--FeatureMatching.use_gpu".into(),
             "1".into(),
@@ -173,7 +273,12 @@ fn matching_flags(sift: SiftBackend) -> Vec<String> {
             "--SiftMatching.cpu_brute_force_matcher".into(),
             "1".into(),
         ],
+    };
+    if guided {
+        flags.push("--FeatureMatching.guided_matching".into());
+        flags.push("1".into());
     }
+    flags
 }
 
 pub fn mapper_spec(
@@ -231,7 +336,8 @@ pub fn global_mapper_spec(image_dir: &Path, database: &Path, sparse_dir: &Path) 
     )
 }
 
-fn uses_exhaustive(settings: PipelineSettings, frame_count: usize) -> bool {
+/// True when the first matcher already tried every pair.
+pub fn uses_exhaustive(settings: PipelineSettings, frame_count: usize) -> bool {
     let knobs = settings.colmap_knobs();
     knobs.matcher == ColmapMatcher::Exhaustive
         && frame_count <= knobs.exhaustive_frame_limit as usize
@@ -239,7 +345,15 @@ fn uses_exhaustive(settings: PipelineSettings, frame_count: usize) -> bool {
 
 fn sequential_overlap(settings: PipelineSettings) -> u32 {
     let knobs = settings.colmap_knobs();
-    settings.sanitized().match_overlap.max(knobs.min_overlap_floor)
+    settings
+        .sanitized()
+        .match_overlap
+        .max(knobs.min_overlap_floor)
+}
+
+fn escalate_overlap(settings: PipelineSettings) -> u32 {
+    let current = sequential_overlap(settings);
+    current.max(current.saturating_mul(2).min(80))
 }
 
 #[cfg(test)]
@@ -563,6 +677,90 @@ mod tests {
             .args
             .windows(2)
             .any(|w| w[0] == "--SequentialMatching.overlap" && w[1] == "8"));
+    }
+
+    fn has_flag(spec: &CommandSpec, flag: &str, value: &str) -> bool {
+        spec.args.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    #[test]
+    fn wider_sequential_escalate_adds_quadratic_overlap_and_guided() {
+        let mut settings = object_settings();
+        settings.match_overlap = 15;
+        let spec = escalate_matcher_spec(
+            Path::new("db"),
+            settings,
+            40,
+            MatchEscalate::WiderSequential,
+        )
+        .expect("sequential escalate");
+        assert_eq!(spec.args[0], "sequential_matcher");
+        assert!(has_flag(&spec, "--SequentialMatching.overlap", "30"));
+        assert!(has_flag(
+            &spec,
+            "--SequentialMatching.quadratic_overlap",
+            "1"
+        ));
+        assert!(has_flag(&spec, "--FeatureMatching.guided_matching", "1"));
+        assert!(has_flag(
+            &spec,
+            "--SiftMatching.cpu_brute_force_matcher",
+            "1"
+        ));
+    }
+
+    #[test]
+    fn overlap_already_above_cap_stays() {
+        let mut settings = object_settings();
+        settings.match_overlap = 100;
+        let spec = escalate_matcher_spec(
+            Path::new("db"),
+            settings,
+            40,
+            MatchEscalate::WiderSequential,
+        )
+        .unwrap();
+        assert!(has_flag(&spec, "--SequentialMatching.overlap", "100"));
+    }
+
+    #[test]
+    fn transitive_escalate_is_guided() {
+        let spec = escalate_matcher_spec(
+            Path::new("db"),
+            object_settings(),
+            40,
+            MatchEscalate::Transitive,
+        )
+        .expect("transitive");
+        assert_eq!(spec.args[0], "transitive_matcher");
+        assert!(has_flag(&spec, "--FeatureMatching.guided_matching", "1"));
+        assert!(has_flag(&spec, "--database_path", "db"));
+    }
+
+    #[test]
+    fn exhaustive_escalate_only_under_limit() {
+        let spec = escalate_matcher_spec(
+            Path::new("db"),
+            object_settings(),
+            40,
+            MatchEscalate::Exhaustive,
+        )
+        .expect("exhaustive under limit");
+        assert_eq!(spec.args[0], "exhaustive_matcher");
+        assert!(has_flag(&spec, "--FeatureMatching.guided_matching", "1"));
+        assert!(escalate_matcher_spec(
+            Path::new("db"),
+            object_settings(),
+            300,
+            MatchEscalate::Exhaustive,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn first_pass_matcher_does_not_set_guided() {
+        let spec = matcher_spec(Path::new("db"), object_settings(), 40);
+        assert!(!spec.args.iter().any(|a| a.contains("guided_matching")));
     }
 
     #[test]

@@ -1,11 +1,13 @@
-import { useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { save, open, confirm } from "@tauri-apps/plugin-dialog";
-import type { ArchiveEntry } from "../types";
+import type { ArchiveEntry, TaskProgress } from "../types";
 import { export3dgs, exportHtml, exportSpz, setArchivePoster } from "../api";
 import { osmBrowseUrl } from "../osm";
 import { convertArchiveToSpz, ensureSpz } from "../spzExport";
-import { SplatViewer } from "./SplatViewer";
+
+const SplatViewer = lazy(() => import("./SplatViewer").then((module) => ({ default: module.SplatViewer })));
 
 type Props = {
   entry: ArchiveEntry;
@@ -21,7 +23,19 @@ export function ArchiveDetail({ entry, onClose, onPoster }: Props) {
   const captureMode = entry.settings?.captureMode ?? "object";
   const [exporting, setExporting] = useState<ExportKind | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [task, setTask] = useState<TaskProgress | null>(null);
   const busy = exporting != null;
+  const showLocalPhase = (phase: string) => setTask({
+    taskId: "local", kind: "spz", phase, indeterminate: true, cancellable: false, status: "running",
+  });
+
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    void listen<TaskProgress>("task-progress", (event) => setTask(event.payload)).then((unlisten) => {
+      stop = unlisten;
+    });
+    return () => stop?.();
+  }, []);
 
   async function onExport3dgs() {
     const dest = await save({
@@ -32,6 +46,7 @@ export function ArchiveDetail({ entry, onClose, onPoster }: Props) {
       return;
     }
     setExporting("archive");
+    setTask(null);
     try {
       await export3dgs(entry.id, dest);
       setError(null);
@@ -48,8 +63,9 @@ export function ArchiveDetail({ entry, onClose, onPoster }: Props) {
       return;
     }
     setExporting("html");
+    showLocalPhase("Preparing SPZ");
     try {
-      await ensureSpz(entry);
+      await ensureSpz(entry, showLocalPhase);
       await exportHtml(entry.id, dest);
       setError(null);
     } catch (err) {
@@ -68,8 +84,9 @@ export function ArchiveDetail({ entry, onClose, onPoster }: Props) {
       return;
     }
     setExporting("spz");
+    showLocalPhase("Preparing SPZ");
     try {
-      await ensureSpz(entry);
+      await ensureSpz(entry, showLocalPhase);
       await exportSpz(entry.id, dest);
       setError(null);
     } catch (err) {
@@ -88,8 +105,9 @@ export function ArchiveDetail({ entry, onClose, onPoster }: Props) {
       return;
     }
     setExporting("convert");
+    showLocalPhase("Preparing SPZ");
     try {
-      await convertArchiveToSpz(entry);
+      await convertArchiveToSpz(entry, showLocalPhase);
       setError(null);
       onPoster();
     } catch (err) {
@@ -123,6 +141,16 @@ export function ArchiveDetail({ entry, onClose, onPoster }: Props) {
             <p>No GPS on this capture.</p>
           )}
           {error ? <p className="archive-error">{error}</p> : null}
+          {busy && task ? (
+            <div className="task-progress" role="status">
+              <span>{task.phase}</span>
+              {task.indeterminate || !task.totalBytes ? (
+                <progress />
+              ) : (
+                <progress max={task.totalBytes} value={task.currentBytes ?? 0} />
+              )}
+            </div>
+          ) : null}
         </div>
         <div className="row">
           <button type="button" disabled={busy} onClick={() => void onExportHtml()}>
@@ -144,16 +172,18 @@ export function ArchiveDetail({ entry, onClose, onPoster }: Props) {
           </button>
         </div>
       </header>
-      <SplatViewer
-        key={`${entry.id}:${entry.plyPath}`}
-        plyPath={entry.plyPath}
-        captureMode={captureMode}
-        viewer={entry.settings?.viewer}
-        onSetPreview={async (jpegBase64) => {
-          await setArchivePoster(entry.id, jpegBase64);
-          onPoster();
-        }}
-      />
+      <Suspense fallback={<div className="viewer"><p className="viewer-hint">Loading 3D viewer…</p></div>}>
+        <SplatViewer
+          key={`${entry.id}:${entry.plyPath}`}
+          plyPath={entry.plyPath}
+          captureMode={captureMode}
+          viewer={entry.settings?.viewer}
+          onSetPreview={async (jpegBase64) => {
+            await setArchivePoster(entry.id, jpegBase64);
+            onPoster();
+          }}
+        />
+      </Suspense>
     </section>
   );
 }

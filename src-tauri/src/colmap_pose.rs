@@ -70,6 +70,10 @@ pub fn first_view_pose(images_bin: &Path) -> Option<ViewPose> {
 
 /// Registered cameras in Spark space, plus a capped XYZ/RGB point cloud.
 pub fn sparse_preview(model_dir: &Path) -> Option<SparsePreview> {
+    sparse_preview_with_limit(model_dir, MAX_SPARSE_POINTS)
+}
+
+pub fn sparse_preview_with_limit(model_dir: &Path, max_points: usize) -> Option<SparsePreview> {
     let images = registered_images(&model_dir.join("images.bin")).unwrap_or_default();
     if images.is_empty() {
         return None;
@@ -85,7 +89,8 @@ pub fn sparse_preview(model_dir: &Path) -> Option<SparsePreview> {
             }
         })
         .collect();
-    let (points, colors) = parse_points3d(&model_dir.join("points3D.bin")).unwrap_or_default();
+    let (points, colors) =
+        parse_points3d(&model_dir.join("points3D.bin"), max_points).unwrap_or_default();
     Some(SparsePreview {
         cameras,
         points,
@@ -195,7 +200,7 @@ fn parse_images_binary(bytes: &[u8]) -> io::Result<Vec<ColmapImage>> {
     Ok(images)
 }
 
-fn parse_points3d(path: &Path) -> io::Result<(Vec<[f32; 3]>, Vec<[u8; 3]>)> {
+fn parse_points3d(path: &Path, max_points: usize) -> io::Result<(Vec<[f32; 3]>, Vec<[u8; 3]>)> {
     let bytes = fs::read(path)?;
     let mut cur = Cursor::new(bytes.as_slice());
     let n = read_u64(&mut cur)?;
@@ -205,8 +210,9 @@ fn parse_points3d(path: &Path) -> io::Result<(Vec<[f32; 3]>, Vec<[u8; 3]>)> {
             "too many points",
         ));
     }
-    let stride = if n as usize > MAX_SPARSE_POINTS {
-        (n as usize / MAX_SPARSE_POINTS).max(1)
+    let max_points = max_points.max(1);
+    let stride = if n as usize > max_points {
+        (n as usize / max_points).max(1)
     } else {
         1
     };
@@ -237,7 +243,7 @@ fn parse_points3d(path: &Path) -> io::Result<(Vec<[f32; 3]>, Vec<[u8; 3]>)> {
             points.push([spark[0] as f32, spark[1] as f32, spark[2] as f32]);
             colors.push(rgb);
         }
-        if points.len() >= MAX_SPARSE_POINTS {
+        if points.len() >= max_points {
             break;
         }
     }

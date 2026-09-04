@@ -26,6 +26,38 @@ export type ProgressEvent = {
   stage: Stage;
   percent: number;
   message: string;
+  runId?: string;
+  sequence?: number;
+  status?: string;
+  phase?: string;
+  phasePercent?: number;
+  attempt?: number | null;
+  strategy?: string | null;
+  current?: number | null;
+  total?: number | null;
+  elapsedSecs?: number | null;
+  etaSecs?: number | null;
+};
+
+export type PipelineProgressV2 = Omit<ProgressEvent, "percent"> & {
+  runId: string;
+  sequence: number;
+  stagePercent: number;
+  phasePercent: number;
+  frames?: FrameStats | null;
+  cameras?: CameraStats | null;
+  train?: TrainStats | null;
+};
+
+export type PipelineStagePlan = {
+  stage: Stage;
+  action: "reuse" | "run" | "invalidate";
+  reason: string;
+};
+
+export type PipelinePlan = {
+  stages: PipelineStagePlan[];
+  invalidateFrom?: Stage | null;
 };
 
 export type TrainStats = {
@@ -40,7 +72,7 @@ export type TrainStats = {
   etaSecs?: number | null;
 };
 
-export type FramePass = "candidates" | "keyframes" | "import";
+export type FramePass = "candidates" | "scoring" | "keyframes" | "import";
 
 export type FrameStats = {
   pass: FramePass;
@@ -64,6 +96,11 @@ export type CameraStats = {
   points?: number | null;
   trying?: number | null;
   failed?: number | null;
+  attempt?: number | null;
+  strategy?: string | null;
+  graphCoverage?: number | null;
+  graphRigidity?: number | null;
+  graphMedianDegree?: number | null;
   elapsedSecs?: number | null;
   etaSecs?: number | null;
 };
@@ -138,6 +175,7 @@ export type PipelineRequest = {
   tempProject: boolean;
   settings: PipelineSettings;
   force: boolean;
+  restart?: boolean;
   until?: Stage;
 };
 
@@ -183,6 +221,27 @@ export type RunResult = {
   archiveError?: string | null;
   completedStage: Stage;
   projectDir: string;
+};
+
+export type TaskProgress = {
+  taskId: string;
+  kind: string;
+  phase: string;
+  currentBytes?: number | null;
+  totalBytes?: number | null;
+  indeterminate: boolean;
+  cancellable: boolean;
+  status: "running" | "complete" | "error";
+};
+
+export type PipelineRunSummary = {
+  runId: string;
+  modifiedMs: number;
+};
+
+export type PipelineLogPage = {
+  lines: string[];
+  nextBefore?: number | null;
 };
 
 const OBJECT_KNOBS = defaultsFor("object");

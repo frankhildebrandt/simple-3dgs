@@ -458,7 +458,10 @@ fn write_fake_frames(spec: &CommandSpec) -> Result<(), PipelineError> {
 #[cfg(test)]
 fn write_fake_colmap(spec: &CommandSpec) -> Result<(), PipelineError> {
     match spec.args.first().map(String::as_str) {
-        Some("feature_extractor") | Some("sequential_matcher") | Some("exhaustive_matcher") => {
+        Some("feature_extractor")
+        | Some("sequential_matcher")
+        | Some("exhaustive_matcher")
+        | Some("transitive_matcher") => {
             if let Some(db) = arg_value(&spec.args, "--database_path") {
                 let path = Path::new(db);
                 if let Some(parent) = path.parent() {
@@ -544,6 +547,7 @@ mod tests {
     fn matcher_subcommands_pin_blas_threads() {
         assert!(colmap_pins_matcher_blas(Some("exhaustive_matcher")));
         assert!(colmap_pins_matcher_blas(Some("sequential_matcher")));
+        assert!(colmap_pins_matcher_blas(Some("transitive_matcher")));
         assert!(!colmap_pins_matcher_blas(Some("feature_extractor")));
         assert!(!colmap_pins_matcher_blas(Some("mapper")));
         assert!(!colmap_pins_matcher_blas(Some("global_mapper")));

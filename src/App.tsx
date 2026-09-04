@@ -1,12 +1,7 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getConfig, saveConfig } from "./api";
 import { parseMenuProject, parseMenuView } from "./appMenu";
-import { ArchiveView } from "./components/ArchiveView";
-import { LogWindow } from "./components/LogWindow";
-import { ReconstructView } from "./components/ReconstructView";
-import { SettingsView } from "./components/SettingsView";
-import { SplatWindow } from "./components/SplatWindow";
 import { TitleBar } from "./components/TitleBar";
 import { toggleNativeFullscreen, watchNativeFullscreen } from "./fullscreen";
 import { isLogWindowSearch } from "./logWindow";
@@ -14,13 +9,23 @@ import { splatIdFromSearch } from "./splatWindow";
 import type { AppConfig, AppView } from "./types";
 import "./App.css";
 
+const ArchiveView = lazy(() => import("./components/ArchiveView").then((module) => ({ default: module.ArchiveView })));
+const LogWindow = lazy(() => import("./components/LogWindow").then((module) => ({ default: module.LogWindow })));
+const ReconstructView = lazy(() => import("./components/ReconstructView").then((module) => ({ default: module.ReconstructView })));
+const SettingsView = lazy(() => import("./components/SettingsView").then((module) => ({ default: module.SettingsView })));
+const SplatWindow = lazy(() => import("./components/SplatWindow").then((module) => ({ default: module.SplatWindow })));
+
+function LoadingView() {
+  return <p className="archive-empty">Loading…</p>;
+}
+
 export default function App() {
   if (isLogWindowSearch(window.location.search)) {
-    return <LogWindow />;
+    return <Suspense fallback={<LoadingView />}><LogWindow /></Suspense>;
   }
   const splatId = splatIdFromSearch(window.location.search);
   if (splatId) {
-    return <SplatWindow splatId={splatId} />;
+    return <Suspense fallback={<LoadingView />}><SplatWindow splatId={splatId} /></Suspense>;
   }
   return <Shell />;
 }
@@ -129,17 +134,22 @@ function Shell() {
       <div className="shell-body">
         {configError ? <p className="archive-error config-error">{configError}</p> : null}
         <div className="shell-page" hidden={settingsOpen || !reconstruct}>
-          <ReconstructView
-            config={config}
-            density={density}
-            fullscreen={fullscreen}
-            onToggleFullscreen={() => {
-              void toggleNativeFullscreen().then(setFullscreen);
-            }}
-          />
+          <Suspense fallback={<LoadingView />}>
+            <ReconstructView
+              config={config}
+              density={density}
+              active={!settingsOpen && reconstruct}
+              fullscreen={fullscreen}
+              onToggleFullscreen={() => {
+                void toggleNativeFullscreen().then(setFullscreen);
+              }}
+            />
+          </Suspense>
         </div>
-        {!settingsOpen && view === "archive" ? <ArchiveView config={config} /> : null}
-        {settingsOpen ? <SettingsView config={config} onConfig={setConfig} /> : null}
+        <Suspense fallback={<LoadingView />}>
+          {!settingsOpen && view === "archive" ? <ArchiveView config={config} /> : null}
+          {settingsOpen ? <SettingsView config={config} onConfig={setConfig} /> : null}
+        </Suspense>
       </div>
     </div>
   );

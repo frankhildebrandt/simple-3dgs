@@ -25,6 +25,11 @@ pub struct CameraSnapshot {
     pub points: Option<u32>,
     pub trying: Option<u32>,
     pub failed: Option<u32>,
+    pub attempt: Option<u32>,
+    pub strategy: Option<String>,
+    pub graph_coverage: Option<f32>,
+    pub graph_rigidity: Option<f32>,
+    pub graph_median_degree: Option<f32>,
     pub elapsed_secs: Option<u64>,
     pub eta_secs: Option<u64>,
     #[serde(skip)]
@@ -47,6 +52,11 @@ impl CameraSnapshot {
             points: None,
             trying: None,
             failed: None,
+            attempt: None,
+            strategy: None,
+            graph_coverage: None,
+            graph_rigidity: None,
+            graph_median_degree: None,
             elapsed_secs: None,
             eta_secs: None,
             visible: None,
@@ -62,7 +72,7 @@ impl CameraSnapshot {
                 Self::new(CameraStep::Features, 20, 30),
                 "Extracting features",
             ),
-            "sequential_matcher" | "exhaustive_matcher" => {
+            "sequential_matcher" | "exhaustive_matcher" | "transitive_matcher" => {
                 (Self::new(CameraStep::Matching, 50, 20), "Matching views")
             }
             "view_graph_calibrator" => (
@@ -395,6 +405,13 @@ I20260816 17:08:10.430540 0x1f629de80 timer.cc:90] Elapsed time: 0.009 [minutes]
         assert_eq!(snap.total, Some(100));
         assert_eq!(snap.percent(), 27);
         assert!(snap.summary().contains("25 / 100"));
+    }
+
+    #[test]
+    fn transitive_matcher_is_matching_step() {
+        let (snap, message) = CameraSnapshot::for_spec("transitive_matcher");
+        assert_eq!(snap.step, CameraStep::Matching);
+        assert_eq!(message, "Matching views");
     }
 
     #[test]

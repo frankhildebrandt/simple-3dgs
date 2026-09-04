@@ -157,7 +157,9 @@ impl PipelineSettings {
             frame_format: self.frame_format,
             jpeg_quality: self.jpeg_quality.clamp(1, 100),
             train_steps: self.train_steps.clamp(TRAIN_STEPS_MIN, TRAIN_STEPS_MAX),
-            match_overlap: self.match_overlap.clamp(MATCH_OVERLAP_MIN, MATCH_OVERLAP_MAX),
+            match_overlap: self
+                .match_overlap
+                .clamp(MATCH_OVERLAP_MIN, MATCH_OVERLAP_MAX),
             capture_mode: self.capture_mode,
             max_splats: self.max_splats.clamp(MAX_SPLATS_MIN, MAX_SPLATS_MAX),
             max_frames: self.max_frames.clamp(MAX_FRAMES_MIN, MAX_FRAMES_MAX),
@@ -397,7 +399,10 @@ mod tests {
         let colmap = settings.sanitized().colmap.expect("hydrated");
         assert_eq!(colmap.mapper, crate::colmap_knobs::ColmapMapper::Global);
         assert_eq!(colmap.min_overlap_floor, 20);
-        assert_eq!(colmap.matcher, crate::colmap_knobs::ColmapMatcher::Exhaustive);
+        assert_eq!(
+            colmap.matcher,
+            crate::colmap_knobs::ColmapMatcher::Exhaustive
+        );
         assert_eq!(colmap.sift_backend, crate::colmap_knobs::SiftBackend::Cpu);
     }
 

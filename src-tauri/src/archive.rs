@@ -135,7 +135,7 @@ impl ArchiveLibrary {
         fs::create_dir_all(&dest)?;
         let ply_dest = dest.join(OUTPUT_PLY);
         if request.ply.canonicalize().ok() != ply_dest.canonicalize().ok() {
-            fs::copy(request.ply, &ply_dest)?;
+            crate::project::link_or_copy(request.ply, &ply_dest)?;
         }
         let stale_spz = dest.join(OUTPUT_SPZ);
         if stale_spz.is_file() {
@@ -239,6 +239,15 @@ impl ArchiveLibrary {
 
     /// Copies the cached `scene.spz` to a user-chosen path.
     pub fn export_spz(&self, id: &str, dest: &Path) -> Result<(), PipelineError> {
+        self.export_spz_with_progress(id, dest, &mut |_, _| {})
+    }
+
+    pub fn export_spz_with_progress(
+        &self,
+        id: &str,
+        dest: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), PipelineError> {
         let entry = self.get(id)?;
         let src = Path::new(&entry.dir).join(OUTPUT_SPZ);
         if !src.is_file() {
@@ -251,7 +260,20 @@ impl ArchiveLibrary {
                 fs::create_dir_all(parent)?;
             }
         }
-        fs::copy(&src, dest)?;
+        let total = fs::metadata(&src)?.len();
+        let mut input = fs::File::open(&src)?;
+        let mut output = fs::File::create(dest)?;
+        let mut current = 0;
+        let mut buffer = [0u8; 1024 * 1024];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            current += count as u64;
+            progress(current, total);
+        }
         Ok(())
     }
 
@@ -280,23 +302,60 @@ impl ArchiveLibrary {
     }
 
     pub fn export_3dgs(&self, id: &str, dest: &Path) -> Result<(), PipelineError> {
+        self.export_3dgs_with_progress(id, dest, &mut |_, _, _| {})
+    }
+
+    pub fn export_3dgs_with_progress(
+        &self,
+        id: &str,
+        dest: &Path,
+        progress: &mut dyn FnMut(&str, u64, u64),
+    ) -> Result<(), PipelineError> {
         let entry = self.get(id)?;
         let src = PathBuf::from(&entry.dir);
         let file = fs::File::create(dest)?;
         let mut zip = ZipWriter::new(file);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        add_zip_file(&mut zip, &src.join(META_FILE), META_FILE, opts)?;
         let splat = if src.join(OUTPUT_PLY).is_file() {
             OUTPUT_PLY
         } else {
             OUTPUT_SPZ
         };
-        add_zip_file(&mut zip, &src.join(splat), splat, opts)?;
+        let mut files = vec![
+            (src.join(META_FILE), META_FILE.to_string()),
+            (src.join(splat), splat.to_string()),
+        ];
         if src.join(VIEW_JSON).is_file() {
-            add_zip_file(&mut zip, &src.join(VIEW_JSON), VIEW_JSON, opts)?;
+            files.push((src.join(VIEW_JSON), VIEW_JSON.to_string()));
         }
         if let Some(poster) = &entry.meta.poster {
-            add_zip_file(&mut zip, &src.join(poster), poster, opts)?;
+            files.push((src.join(poster), poster.clone()));
+        }
+        let runs_dir = src.join("runs");
+        if let Ok(runs) = fs::read_dir(&runs_dir) {
+            let mut logs = runs
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+                .collect::<Vec<_>>();
+            logs.sort();
+            for path in logs.into_iter().rev().take(10).rev() {
+                if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+                    files.push((path.clone(), format!("runs/{name}")));
+                }
+            }
+        }
+        let total = files
+            .iter()
+            .filter_map(|(path, _)| fs::metadata(path).ok())
+            .map(|meta| meta.len())
+            .sum();
+        let mut current = 0;
+        for (path, name) in files {
+            add_zip_file(&mut zip, &path, &name, opts, &mut |bytes| {
+                current += bytes;
+                progress("Pack archive", current, total);
+            })?;
         }
         zip.finish().map_err(zip_err)?;
         Ok(())
@@ -304,6 +363,14 @@ impl ArchiveLibrary {
 
     /// Unpacks a `.3dgs` zip into the library. Collision on id gets a fresh suffix.
     pub fn import_3dgs(&self, zip_path: &Path) -> Result<ArchiveEntry, PipelineError> {
+        self.import_3dgs_with_progress(zip_path, &mut |_, _, _| {})
+    }
+
+    pub fn import_3dgs_with_progress(
+        &self,
+        zip_path: &Path,
+        progress: &mut dyn FnMut(&str, u64, u64),
+    ) -> Result<ArchiveEntry, PipelineError> {
         let file = fs::File::open(zip_path).map_err(|_| {
             PipelineError::message(format!("Could not open {}", zip_path.display()))
         })?;
@@ -314,6 +381,10 @@ impl ArchiveLibrary {
             .join(SCRATCH_DIR)
             .join(format!("import-{}", Uuid::new_v4()));
         fs::create_dir_all(&tmp)?;
+        let total = (0..archive.len())
+            .filter_map(|index| archive.by_index(index).ok().map(|file| file.size()))
+            .sum::<u64>();
+        let mut current = 0;
         for i in 0..archive.len() {
             let mut zipped = archive.by_index(i).map_err(zip_err)?;
             let name = zipped.name().to_string();
@@ -326,7 +397,16 @@ impl ArchiveLibrary {
                 fs::create_dir_all(parent)?;
             }
             let mut out = fs::File::create(&dest)?;
-            std::io::copy(&mut zipped, &mut out)?;
+            let mut buffer = [0u8; 1024 * 1024];
+            loop {
+                let count = zipped.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                out.write_all(&buffer[..count])?;
+                current += count as u64;
+                progress("Unpack archive", current, total);
+            }
         }
         let meta_path = find_meta(&tmp)?;
         let mut meta: ArchiveMeta =
@@ -351,10 +431,10 @@ impl ArchiveLibrary {
         }
         fs::create_dir_all(&dest)?;
         if ply_src.is_file() {
-            fs::copy(&ply_src, dest.join(OUTPUT_PLY))?;
+            crate::project::link_or_copy(&ply_src, &dest.join(OUTPUT_PLY))?;
         }
         if spz_src.is_file() {
-            fs::copy(&spz_src, dest.join(OUTPUT_SPZ))?;
+            crate::project::link_or_copy(&spz_src, &dest.join(OUTPUT_SPZ))?;
         }
         let view_src = splat_src.join(VIEW_JSON);
         if view_src.is_file() {
@@ -364,6 +444,17 @@ impl ArchiveLibrary {
             let src_poster = meta_path.parent().unwrap_or(&tmp).join(poster);
             if src_poster.is_file() {
                 fs::copy(&src_poster, dest.join(poster))?;
+            }
+        }
+        let runs_src = splat_src.join("runs");
+        if let Ok(runs) = fs::read_dir(&runs_src) {
+            let runs_dest = dest.join("runs");
+            fs::create_dir_all(&runs_dest)?;
+            for entry in runs.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                    crate::project::link_or_copy(&path, &runs_dest.join(entry.file_name()))?;
+                }
             }
         }
         let splat = if dest.join(OUTPUT_PLY).is_file() {
@@ -478,6 +569,7 @@ fn add_zip_file(
     path: &Path,
     name: &str,
     opts: SimpleFileOptions,
+    progress: &mut dyn FnMut(u64),
 ) -> Result<(), PipelineError> {
     if !path.is_file() {
         return Err(PipelineError::message(format!(
@@ -486,9 +578,15 @@ fn add_zip_file(
     }
     zip.start_file(name, opts).map_err(zip_err)?;
     let mut file = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    zip.write_all(&buf)?;
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buf)?;
+        if count == 0 {
+            break;
+        }
+        zip.write_all(&buf[..count])?;
+        progress(count as u64);
+    }
     Ok(())
 }
 
@@ -695,6 +793,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let lib = ArchiveLibrary::open(dir.path().join("archive")).unwrap();
         let entry = ingest_ply(&lib, dir.path(), "scene.ply");
+        let runs = Path::new(&entry.dir).join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        fs::write(runs.join("run.jsonl"), b"{\"kind\":\"log\"}\n").unwrap();
         let zip_path = dir.path().join("scene.3dgs");
         lib.export_3dgs(&entry.meta.id, &zip_path).unwrap();
         let other = ArchiveLibrary::open(dir.path().join("other")).unwrap();
@@ -702,6 +803,7 @@ mod tests {
         assert_eq!(imported.meta.geo.as_ref().unwrap().lon, 13.405);
         assert_eq!(imported.meta.source_kind, "import");
         assert!(Path::new(&imported.ply_path).is_file());
+        assert!(Path::new(&imported.dir).join("runs/run.jsonl").is_file());
         assert_eq!(other.list().unwrap().len(), 1);
     }
 

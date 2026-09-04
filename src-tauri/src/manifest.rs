@@ -28,6 +28,34 @@ pub struct ProjectManifest {
     pub updated_at: String,
     #[serde(default)]
     pub temp: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprints: Option<StageFingerprints>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StageFingerprints {
+    pub version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colmap: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub train: Option<String>,
+}
+
+impl Default for StageFingerprints {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            source: None,
+            frames: None,
+            colmap: None,
+            train: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,6 +115,7 @@ impl ProjectManifest {
             created_at: now.clone(),
             updated_at: now,
             temp,
+            fingerprints: None,
         }
     }
 
@@ -109,6 +138,36 @@ impl ProjectManifest {
     pub fn touch_stage(&mut self, stage: Stage) {
         self.stage = stage.as_str().into();
         self.updated_at = chrono::Utc::now().to_rfc3339();
+    }
+
+    pub fn set_fingerprint(&mut self, stage: Stage, value: String) {
+        let fingerprints = self
+            .fingerprints
+            .get_or_insert_with(StageFingerprints::default);
+        match stage {
+            Stage::Frames => fingerprints.frames = Some(value),
+            Stage::Colmap => fingerprints.colmap = Some(value),
+            Stage::Train => fingerprints.train = Some(value),
+        }
+    }
+
+    pub fn clear_fingerprints_from(&mut self, stage: Stage) {
+        let fingerprints = self
+            .fingerprints
+            .get_or_insert_with(StageFingerprints::default);
+        match stage {
+            Stage::Frames => {
+                fingerprints.source = None;
+                fingerprints.frames = None;
+                fingerprints.colmap = None;
+                fingerprints.train = None;
+            }
+            Stage::Colmap => {
+                fingerprints.colmap = None;
+                fingerprints.train = None;
+            }
+            Stage::Train => fingerprints.train = None,
+        }
     }
 }
 

@@ -139,10 +139,19 @@ pub fn select_keyframes(scores: &[CandidateScore], config: KeyframeConfig) -> Ve
 
 /// Scores every still in `dir` (sorted names) as Laplacian variance plus MAD to the previous frame.
 pub fn score_candidates(dir: &Path) -> Result<Vec<CandidateScore>, PipelineError> {
+    score_candidates_with_progress(dir, &mut |_, _| {})
+}
+
+pub fn score_candidates_with_progress(
+    dir: &Path,
+    on_progress: &mut dyn FnMut(u32, u32),
+) -> Result<Vec<CandidateScore>, PipelineError> {
     let paths = list_stills(dir)?;
+    let total = paths.len() as u32;
+    let emit_every = (total / 100).max(1);
     let mut prev: Option<GrayImage> = None;
     let mut scores = Vec::with_capacity(paths.len());
-    for path in paths {
+    for (index, path) in paths.into_iter().enumerate() {
         let gray = match image::open(&path) {
             Ok(img) => img.to_luma8(),
             Err(_) => {
@@ -151,6 +160,10 @@ pub fn score_candidates(dir: &Path) -> Result<Vec<CandidateScore>, PipelineError
                     motion: 0.0,
                 });
                 prev = None;
+                let current = index as u32 + 1;
+                if current == total || current % emit_every == 0 {
+                    on_progress(current, total);
+                }
                 continue;
             }
         };
@@ -161,6 +174,10 @@ pub fn score_candidates(dir: &Path) -> Result<Vec<CandidateScore>, PipelineError
             .unwrap_or(0.0);
         prev = Some(gray);
         scores.push(CandidateScore { sharpness, motion });
+        let current = index as u32 + 1;
+        if current == total || current % emit_every == 0 {
+            on_progress(current, total);
+        }
     }
     Ok(scores)
 }
@@ -363,8 +380,8 @@ fn constant(len: usize, motion: f32, sharpness: f32) -> Vec<CandidateScore> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::preset::Preset;
     use crate::extract_knobs::ExtractKnobs;
+    use crate::preset::Preset;
     use crate::project::MIN_FRAMES;
     use crate::settings::{ExtractMode, PipelineSettings};
     use image::{GrayImage, Luma, Rgb, RgbImage};

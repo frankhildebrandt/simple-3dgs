@@ -7,6 +7,7 @@ use std::time::Instant;
 use crate::archive::{ArchiveLibrary, IngestRequest};
 use crate::brush;
 use crate::colmap;
+use crate::colmap_knobs::SiftBackend;
 use crate::colmap_log::CameraSnapshot;
 use crate::colmap_pose;
 use crate::error::PipelineError;
@@ -15,10 +16,11 @@ use crate::frame_log::{FramePass, FrameSnapshot};
 use crate::geo::{self, GeoFix};
 use crate::keyframes::{self, KeyframeConfig};
 use crate::manifest::{self, FrameEntry, FrameManifest, ProjectManifest};
+use crate::match_graph;
+use crate::pipeline_plan;
 use crate::project::{
     assemble_dataset, count_frames, finalize_ply, ProjectLayout, Stage, MIN_FRAMES,
 };
-use crate::colmap_knobs::SiftBackend;
 use crate::settings::{ExtractMode, PipelineSettings};
 use crate::sidecar::{self, CancelFlag, CommandSpec, SidecarRunner};
 use crate::train_log::TrainSnapshot;
@@ -38,6 +40,8 @@ pub struct PipelineConfig {
     pub kind: InputKind,
     pub settings: PipelineSettings,
     pub force: bool,
+    /// Wipe `until` and later stages, then re-run. Ignored when `force` is set.
+    pub restart: bool,
     pub until: Stage,
 }
 
@@ -52,6 +56,8 @@ pub struct PipelineOutcome {
 }
 
 pub trait PipelineEvents {
+    fn begin_run(&mut self, _project_dir: &Path) {}
+    fn finish_run(&mut self, _status: &str) {}
     fn progress(&mut self, stage: Stage, percent: u8, message: &str);
     fn log(&mut self, line: &str);
     fn preview(&mut self, path: &Path);
@@ -60,6 +66,9 @@ pub trait PipelineEvents {
     fn camera_stats(&mut self, _stats: &CameraSnapshot) {}
     fn frame_preview(&mut self, _path: &Path) {}
     fn sparse_preview(&mut self, _preview: &colmap_pose::SparsePreview) {}
+    fn wants_preview(&self) -> bool {
+        true
+    }
 }
 
 /// Runs extract → COLMAP → Brush, then archives the splat. Returns the PLY to display.
@@ -73,28 +82,53 @@ pub fn run_pipeline(
     let project_dir = resolve_project_dir(config, &library)?;
     let layout = ProjectLayout::new(&project_dir);
     layout.create()?;
-    upsert_manifest(config, &layout);
-
-    if config.force {
-        layout.clear_from(Stage::Frames)?;
+    events.begin_run(layout.root());
+    let manifest_path = manifest::project_file(layout.root());
+    let previous = ProjectManifest::load(&manifest_path).ok();
+    if previous.as_ref().is_some_and(|saved| {
+        let saved_path = Path::new(&saved.source_path);
+        saved_path.canonicalize().ok() != config.source.canonicalize().ok()
+            && saved_path != config.source
+    }) {
+        return Err(PipelineError::message(
+            "This project belongs to a different source. Create a new project for the new capture.",
+        ));
     }
+    let plan = pipeline_plan::build(
+        &layout,
+        previous.as_ref(),
+        &config.source,
+        source_kind(config.kind),
+        config.settings,
+    )?;
+
+    let invalidate = if config.force {
+        Some(Stage::Frames)
+    } else if config.restart {
+        Some(config.until)
+    } else {
+        plan.invalidate_from.as_deref().and_then(stage_from_str)
+    };
+    if let Some(stage) = invalidate {
+        layout.clear_from(stage)?;
+    }
+    upsert_manifest(config, &layout, invalidate);
 
     run_frames(config, &layout, runner, cancel, events)?;
-    persist_stage(&layout, Stage::Frames);
+    persist_stage(&layout, Stage::Frames, &plan.expected);
     if config.until == Stage::Frames {
         return Ok(stage_outcome(&layout, Stage::Frames));
     }
 
     run_colmap(&layout, config.settings, runner, cancel, events)?;
-    persist_stage(&layout, Stage::Colmap);
+    persist_stage(&layout, Stage::Colmap, &plan.expected);
     if config.until == Stage::Colmap {
         return Ok(stage_outcome(&layout, Stage::Colmap));
     }
 
     run_train(&layout, config.settings, runner, cancel, events)?;
-    persist_stage(&layout, Stage::Train);
+    persist_stage(&layout, Stage::Train, &plan.expected);
 
-    events.progress(Stage::Train, 100, "Done");
     archive_outcome(config, &library, &layout, runner, events)
 }
 
@@ -114,15 +148,31 @@ fn resolve_project_dir(
     }
 }
 
-fn persist_stage(layout: &ProjectLayout, stage: Stage) {
+fn persist_stage(layout: &ProjectLayout, stage: Stage, expected: &manifest::StageFingerprints) {
     let path = manifest::project_file(layout.root());
     if let Ok(mut manifest) = ProjectManifest::load(&path) {
         manifest.touch_stage(stage);
+        let value = match stage {
+            Stage::Frames => expected.frames.clone(),
+            Stage::Colmap => expected.colmap.clone(),
+            Stage::Train => expected.train.clone(),
+        };
+        if let Some(value) = value {
+            manifest.set_fingerprint(stage, value);
+            if stage == Stage::Frames {
+                if let Some(source) = expected.source.clone() {
+                    manifest
+                        .fingerprints
+                        .get_or_insert_with(manifest::StageFingerprints::default)
+                        .source = Some(source);
+                }
+            }
+        }
         let _ = manifest.save(&path);
     }
 }
 
-fn upsert_manifest(config: &PipelineConfig, layout: &ProjectLayout) {
+fn upsert_manifest(config: &PipelineConfig, layout: &ProjectLayout, invalidate: Option<Stage>) {
     let path = manifest::project_file(layout.root());
     let source_kind = match config.kind {
         InputKind::Video => "video",
@@ -141,8 +191,27 @@ fn upsert_manifest(config: &PipelineConfig, layout: &ProjectLayout) {
     manifest.source_kind = source_kind.into();
     manifest.settings = config.settings;
     manifest.temp = config.temp_project;
+    if let Some(stage) = invalidate {
+        manifest.clear_fingerprints_from(stage);
+    }
     manifest.updated_at = chrono::Utc::now().to_rfc3339();
     let _ = manifest.save(&path);
+}
+
+fn source_kind(kind: InputKind) -> &'static str {
+    match kind {
+        InputKind::Video => "video",
+        InputKind::Images => "images",
+    }
+}
+
+fn stage_from_str(value: &str) -> Option<Stage> {
+    match value {
+        "frames" => Some(Stage::Frames),
+        "colmap" => Some(Stage::Colmap),
+        "train" => Some(Stage::Train),
+        _ => None,
+    }
 }
 
 fn stage_outcome(layout: &ProjectLayout, stage: Stage) -> PipelineOutcome {
@@ -164,6 +233,7 @@ fn archive_outcome(
 ) -> Result<PipelineOutcome, PipelineError> {
     if let Some(id) = layout.archived_id() {
         if let Ok(entry) = library.get(&id) {
+            events.progress(Stage::Train, 100, "Reused archived result");
             return Ok(PipelineOutcome {
                 ply: PathBuf::from(entry.ply_path),
                 archive_id: Some(id),
@@ -175,6 +245,7 @@ fn archive_outcome(
     }
 
     let geo = probe_geo(config, runner, events);
+    events.progress(Stage::Train, 99, "Archiving result");
     let frame_count = count_frames(&layout.frames_dir()).unwrap_or(0) as u32;
     let source_kind = match config.kind {
         InputKind::Video => "video",
@@ -192,6 +263,9 @@ fn archive_outcome(
     }) {
         Ok(entry) => {
             layout.mark_archived(&entry.meta.id)?;
+            events.progress(Stage::Train, 100, "Saved to archive");
+            events.finish_run("complete");
+            copy_run_logs(layout.root(), Path::new(&entry.dir));
             if config.temp_project {
                 let _ = fs::remove_dir_all(layout.root());
             }
@@ -206,6 +280,8 @@ fn archive_outcome(
         Err(err) => {
             let message = err.to_string();
             events.log(&format!("Archive failed: {message}"));
+            events.progress(Stage::Train, 100, "Splat ready; archive failed");
+            events.finish_run("partial");
             Ok(PipelineOutcome {
                 ply: layout.output_ply(),
                 archive_id: None,
@@ -213,6 +289,25 @@ fn archive_outcome(
                 completed_stage: Stage::Train,
                 project_dir: layout.root().to_path_buf(),
             })
+        }
+    }
+}
+
+fn copy_run_logs(project_dir: &Path, archive_dir: &Path) {
+    let source = project_dir.join("runs");
+    if !source.is_dir() {
+        return;
+    }
+    let dest = archive_dir.join("runs");
+    if fs::create_dir_all(&dest).is_err() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(source) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                let _ = fs::copy(&path, dest.join(entry.file_name()));
+            }
         }
     }
 }
@@ -264,15 +359,46 @@ fn run_frames(
     events.progress(Stage::Frames, 5, "Preparing frames");
     match config.kind {
         InputKind::Video => {
-            let video = copy_input_video(&config.source, &layout.input_dir())?;
-            extract_video_keyframes(&video, layout, config.settings, runner, events)?;
+            if !config.source.is_file() {
+                return Err(PipelineError::message(format!(
+                    "Video not found: {}",
+                    config.source.display()
+                )));
+            }
+            extract_video_keyframes(&config.source, layout, config.settings, runner, events)?;
         }
         InputKind::Images => {
             let mut snap = FrameSnapshot::new(FramePass::Import);
             events.frame_stats(&snap);
             events.progress(Stage::Frames, 20, "Importing stills");
-            import_image_folder(&config.source, &layout.frames_dir())?;
-            write_still_frames_manifest(layout)?;
+            let started = Instant::now();
+            import_image_folder(
+                &config.source,
+                &layout.frames_dir(),
+                &mut |current, total| {
+                    snap.current = Some(current);
+                    snap.total = Some(total);
+                    snap.elapsed_secs = Some(started.elapsed().as_secs());
+                    snap.eta_secs = if current > 0 && current < total {
+                        Some(
+                            started
+                                .elapsed()
+                                .as_secs()
+                                .saturating_mul(u64::from(total - current))
+                                / u64::from(current),
+                        )
+                    } else {
+                        Some(0)
+                    };
+                    events.frame_stats(&snap);
+                    events.progress(
+                        Stage::Frames,
+                        20 + ((u64::from(current) * 75 / u64::from(total.max(1))) as u8),
+                        &format!("Importing stills {current}/{total}"),
+                    );
+                },
+            )?;
+            write_still_frames_manifest(layout, events)?;
             snap.current = Some(count_frames(&layout.frames_dir())? as u32);
             snap.total = snap.current;
             events.frame_stats(&snap);
@@ -313,8 +439,33 @@ fn extract_video_keyframes(
         &mut snap,
     )?;
 
-    events.progress(Stage::Frames, 55, "Selecting keyframes");
-    let scores = keyframes::score_candidates(&candidates)?;
+    let score_started = Instant::now();
+    let mut scoring = FrameSnapshot::new(FramePass::Scoring);
+    events.frame_stats(&scoring);
+    events.progress(Stage::Frames, 55, "Scoring candidate frames");
+    let scores = keyframes::score_candidates_with_progress(&candidates, &mut |current, total| {
+        scoring.current = Some(current);
+        scoring.total = Some(total);
+        scoring.elapsed_secs = Some(score_started.elapsed().as_secs());
+        scoring.eta_secs = if current > 0 && current < total {
+            Some(
+                score_started
+                    .elapsed()
+                    .as_secs()
+                    .saturating_mul(u64::from(total - current))
+                    / u64::from(current),
+            )
+        } else {
+            Some(0)
+        };
+        events.frame_stats(&scoring);
+        events.progress(
+            Stage::Frames,
+            55 + (current.saturating_mul(13) / total.max(1)) as u8,
+            &format!("Scoring {current}/{total}"),
+        );
+    })?;
+    events.progress(Stage::Frames, 69, "Selecting keyframes");
     let config = KeyframeConfig::from_settings(settings);
     let picked = keyframes::select_keyframes(&scores, config);
     if picked.is_empty() {
@@ -386,9 +537,26 @@ fn write_video_frames_manifest(
     FrameManifest { frames }.save(&manifest::frames_file(layout.root()))
 }
 
-fn write_still_frames_manifest(layout: &ProjectLayout) -> Result<(), PipelineError> {
+fn write_still_frames_manifest(
+    layout: &ProjectLayout,
+    events: &mut dyn PipelineEvents,
+) -> Result<(), PipelineError> {
     let paths = keyframes::list_stills(&layout.frames_dir())?;
-    let scores = keyframes::score_candidates(&layout.frames_dir()).unwrap_or_default();
+    let started = Instant::now();
+    let mut snap = FrameSnapshot::new(FramePass::Scoring);
+    let scores =
+        keyframes::score_candidates_with_progress(&layout.frames_dir(), &mut |current, total| {
+            snap.current = Some(current);
+            snap.total = Some(total);
+            snap.elapsed_secs = Some(started.elapsed().as_secs());
+            events.frame_stats(&snap);
+            events.progress(
+                Stage::Frames,
+                96 + (current.saturating_mul(3) / total.max(1)) as u8,
+                &format!("Scoring {current}/{total}"),
+            );
+        })
+        .unwrap_or_default();
     let frames = paths
         .iter()
         .enumerate()
@@ -441,55 +609,95 @@ fn run_colmap(
     cancel.check()?;
     if layout.is_complete(Stage::Colmap) && layout.sparse_model_dir().join("images.bin").is_file() {
         events.progress(Stage::Colmap, 100, "Camera poses already reconstructed");
-        if let Some(preview) = colmap_pose::sparse_preview(&layout.sparse_model_dir()) {
-            events.sparse_preview(&preview);
+        if events.wants_preview() {
+            if let Some(preview) = colmap_pose::sparse_preview(&layout.sparse_model_dir()) {
+                events.sparse_preview(&preview);
+            }
         }
         return Ok(());
     }
 
     events.progress(Stage::Colmap, 10, "Estimating camera poses");
+    let settings = settings.sanitized();
     if settings.colmap_knobs().sift_backend == SiftBackend::Metal {
-        colmap::require_metal_sidecar(
-            &sidecar::resolve_binary("colmap")?,
-            settings.sanitized().capture_mode,
-        )?;
+        colmap::require_metal_sidecar(&sidecar::resolve_binary("colmap")?, settings.capture_mode)?;
     }
     fs::create_dir_all(layout.sparse_dir())?;
     let selected = selected_frame_count(layout)?;
     let image_list = write_selected_image_list(layout)?;
-    let specs = colmap::reconstruction_specs(
+    let extract = colmap::feature_extractor_spec(
         &layout.frames_dir(),
         &layout.database_path(),
-        &layout.sparse_dir(),
+        settings,
+        Some(&image_list),
+    )
+    .capture(settings.capture_mode);
+    let mut colmap_run = ColmapRun {
+        layout,
         settings,
         selected,
-        &layout.database_global_path(),
-        Some(&image_list),
-    );
-    for spec in &specs {
-        cancel.check()?;
-        if is_view_graph_calibrator(spec) {
-            copy_database_for_global(layout)?;
+        runner,
+        cancel,
+        events,
+        matching_attempt: 0,
+    };
+    colmap_run.step(&extract)?;
+
+    let first = colmap::matcher_spec(&layout.database_path(), settings, selected)
+        .capture(settings.capture_mode);
+    colmap_run.step(&first)?;
+
+    let mut used = [false; 3];
+    if !colmap::uses_exhaustive(settings, selected) {
+        colmap_run.escalate(&mut used, true)?;
+    }
+
+    colmap_run.mapping()?;
+    if match_graph::reconstruction_too_small(
+        registered_cameras(layout),
+        selected as u32,
+        settings.colmap_knobs().min_model_size,
+    ) {
+        if match_graph::inspect(&layout.database_path()).is_some()
+            && !colmap::uses_exhaustive(settings, selected)
+            && used.iter().any(|step| !step)
+        {
+            colmap_run
+                .events
+                .log("Too few cameras registered, rematching");
+            colmap_run
+                .events
+                .progress(Stage::Colmap, 70, "Too few cameras registered, rematching");
+            wipe_sparse_model(layout)?;
+            colmap_run.escalate(&mut used, false)?;
+            colmap_run.mapping()?;
         }
-        let sub = spec.args.first().map(String::as_str).unwrap_or("");
-        let (mut snap, message) = CameraSnapshot::for_spec(sub);
-        snap.total = Some(selected as u32);
-        events.camera_stats(&snap);
-        events.progress(Stage::Colmap, snap.percent(), message);
-        run_colmap_logged(runner, spec, events, layout, &mut snap, selected as u32)?;
+        if match_graph::reconstruction_too_small(
+            registered_cameras(layout),
+            selected as u32,
+            settings.colmap_knobs().min_model_size,
+        ) {
+            return Err(PipelineError::colmap_failed_with(
+                1,
+                "",
+                settings.capture_mode,
+            ));
+        }
     }
 
     if !layout.sparse_model_dir().join("images.bin").is_file() {
         return Err(PipelineError::colmap_failed_with(
             1,
             "",
-            settings.sanitized().capture_mode,
+            settings.capture_mode,
         ));
     }
     assemble_dataset(layout)?;
     write_cameras_manifest(layout)?;
-    if let Some(preview) = colmap_pose::sparse_preview(&layout.sparse_model_dir()) {
-        events.sparse_preview(&preview);
+    if events.wants_preview() {
+        if let Some(preview) = colmap_pose::sparse_preview(&layout.sparse_model_dir()) {
+            events.sparse_preview(&preview);
+        }
     }
     let mut done = CameraSnapshot::for_spec("mapper").0;
     done.set_counts(
@@ -500,6 +708,124 @@ fn run_colmap(
     events.camera_stats(&done);
     layout.mark_complete(Stage::Colmap)?;
     events.progress(Stage::Colmap, 100, "Sparse reconstruction ready");
+    Ok(())
+}
+
+struct ColmapRun<'a> {
+    layout: &'a ProjectLayout,
+    settings: PipelineSettings,
+    selected: usize,
+    runner: &'a mut dyn SidecarRunner,
+    cancel: &'a CancelFlag,
+    events: &'a mut dyn PipelineEvents,
+    matching_attempt: u32,
+}
+
+impl ColmapRun<'_> {
+    fn step(&mut self, spec: &CommandSpec) -> Result<(), PipelineError> {
+        self.cancel.check()?;
+        if is_view_graph_calibrator(spec) {
+            copy_database_for_global(self.layout)?;
+        }
+        let sub = spec.args.first().map(String::as_str).unwrap_or("");
+        let (mut snap, message) = CameraSnapshot::for_spec(sub);
+        if matches!(
+            sub,
+            "sequential_matcher" | "exhaustive_matcher" | "transitive_matcher"
+        ) {
+            self.matching_attempt += 1;
+            snap.attempt = Some(self.matching_attempt);
+            snap.strategy = Some(match sub {
+                "exhaustive_matcher" => "Exhaustive".into(),
+                "transitive_matcher" => "Transitive".into(),
+                _ => "Sequential".into(),
+            });
+        }
+        snap.total = Some(self.selected as u32);
+        self.events.camera_stats(&snap);
+        self.events.progress(Stage::Colmap, snap.percent(), message);
+        run_colmap_logged(
+            self.runner,
+            spec,
+            self.events,
+            self.layout,
+            &mut snap,
+            self.selected as u32,
+        )?;
+        if snap.step == crate::colmap_log::CameraStep::Matching {
+            if let Some(graph) = match_graph::inspect(&self.layout.database_path()) {
+                snap.graph_coverage = Some(graph.coverage());
+                snap.graph_rigidity = Some(graph.rigidity());
+                snap.graph_median_degree = Some(graph.median_degree());
+                self.events.camera_stats(&snap);
+                self.events.log(&format!(
+                    "Match graph: {:.0}% coverage, {:.0}% rigid, median degree {:.1}",
+                    graph.coverage() * 100.0,
+                    graph.rigidity() * 100.0,
+                    graph.median_degree()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn mapping(&mut self) -> Result<(), PipelineError> {
+        for spec in colmap::mapping_specs(
+            &self.layout.frames_dir(),
+            &self.layout.database_path(),
+            &self.layout.sparse_dir(),
+            self.settings,
+            &self.layout.database_global_path(),
+        ) {
+            self.step(&spec)?;
+        }
+        Ok(())
+    }
+
+    /// Runs unused rematch steps. `stop_when_strong` ends the ladder once the graph looks usable.
+    fn escalate(
+        &mut self,
+        used: &mut [bool; 3],
+        stop_when_strong: bool,
+    ) -> Result<(), PipelineError> {
+        for (index, step) in colmap::MatchEscalate::ALL.iter().copied().enumerate() {
+            if used[index] {
+                continue;
+            }
+            if stop_when_strong && !graph_needs_escalate(self.layout) {
+                return Ok(());
+            }
+            used[index] = true;
+            let Some(spec) = colmap::escalate_matcher_spec(
+                &self.layout.database_path(),
+                self.settings,
+                self.selected,
+                step,
+            ) else {
+                continue;
+            };
+            self.events.log(step.log_line());
+            self.events.progress(Stage::Colmap, 55, step.log_line());
+            self.step(&spec)?;
+        }
+        Ok(())
+    }
+}
+
+fn graph_needs_escalate(layout: &ProjectLayout) -> bool {
+    match_graph::inspect(&layout.database_path()).is_some_and(|graph| graph.needs_escalate())
+}
+
+fn registered_cameras(layout: &ProjectLayout) -> Option<u32> {
+    colmap_pose::registered_count(&layout.sparse_model_dir().join("images.bin"))
+}
+
+fn wipe_sparse_model(layout: &ProjectLayout) -> Result<(), PipelineError> {
+    let dir = layout.sparse_dir();
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    fs::create_dir_all(&dir)?;
     Ok(())
 }
 
@@ -594,15 +920,20 @@ fn run_train(
         settings,
         frame_count,
     );
-    run_train_logged(runner, &spec, settings.sanitized().train_steps, events)?;
+    if let Err(err) = run_train_logged(runner, &spec, settings.sanitized().train_steps, events) {
+        let _ = crate::project::prune_export_checkpoints(&layout.output_dir(), 1);
+        return Err(err);
+    }
+    events.progress(Stage::Train, 98, "Save result");
     finalize_ply(&layout.output_dir(), &layout.output_ply())?;
     if !layout.output_ply().is_file() {
         return Err(PipelineError::message(
             "Brush finished but scene.ply is missing.",
         ));
     }
+    crate::project::prune_export_checkpoints(&layout.output_dir(), 0)?;
     layout.mark_complete(Stage::Train)?;
-    events.progress(Stage::Train, 100, "Splat exported");
+    events.progress(Stage::Train, 99, "Splat ready");
     Ok(())
 }
 
@@ -615,7 +946,7 @@ fn warm_start_from_export(
         return Ok(());
     };
     fs::create_dir_all(layout.dataset_dir())?;
-    fs::copy(&src, layout.init_ply())?;
+    crate::project::link_or_copy(&src, &layout.init_ply())?;
     events.log(&format!(
         "Continue from {} as dataset/init.ply (warm start, not a full checkpoint)",
         src.file_name()
@@ -660,6 +991,9 @@ fn run_train_logged(
             ev.log(&format!("Preview checkpoint {}", path.display()));
             ev.progress(Stage::Train, snap.percent(), &snap.summary());
             ev.train_stats(&snap);
+            if let Some(dir) = spec.watch_dir.as_deref() {
+                let _ = crate::project::prune_export_checkpoints(dir, 2);
+            }
         },
     )
 }
@@ -709,6 +1043,7 @@ fn run_colmap_logged(
     let events = std::cell::RefCell::new(events);
     let snap = std::cell::RefCell::new(snap);
     let last_sparse = std::cell::Cell::new(started);
+    let last_sparse_signature = std::cell::RefCell::new(None);
     runner.run(
         spec,
         &mut |line| {
@@ -725,15 +1060,25 @@ fn run_colmap_logged(
                 ev.camera_stats(&snap);
                 ev.progress(Stage::Colmap, snap.percent(), &snap.summary());
             }
-            if last_sparse.get().elapsed().as_millis() >= 500 {
+            if last_sparse.get().elapsed().as_secs() >= 2 {
                 last_sparse.set(Instant::now());
-                if let Some(preview) = colmap_pose::sparse_preview(&layout.sparse_model_dir()) {
-                    snap.set_counts(
-                        Some(preview.cameras.len() as u32),
-                        Some(preview.points.len() as u32),
-                        Some(frame_total),
-                    );
-                    ev.sparse_preview(&preview);
+                let signature = sparse_model_signature(&layout.sparse_model_dir());
+                let changed_model =
+                    signature.is_some() && *last_sparse_signature.borrow() != signature;
+                if changed_model && ev.wants_preview() {
+                    *last_sparse_signature.borrow_mut() = signature;
+                }
+                if changed_model {
+                    if let Some(preview) =
+                        colmap_pose::sparse_preview_with_limit(&layout.sparse_model_dir(), 10_000)
+                    {
+                        snap.set_counts(
+                            Some(preview.cameras.len() as u32),
+                            Some(preview.points.len() as u32),
+                            Some(frame_total),
+                        );
+                        ev.sparse_preview(&preview);
+                    }
                 }
                 ev.camera_stats(&snap);
                 ev.progress(Stage::Colmap, snap.percent(), &snap.summary());
@@ -750,26 +1095,27 @@ fn run_colmap_logged(
     )
 }
 
-fn copy_input_video(source: &Path, input_dir: &Path) -> Result<PathBuf, PipelineError> {
-    if !source.is_file() {
-        return Err(PipelineError::message(format!(
-            "Video not found: {}",
-            source.display()
-        )));
+fn sparse_model_signature(model_dir: &Path) -> Option<(u64, u128, u64, u128)> {
+    fn stamp(path: &Path) -> Option<(u64, u128)> {
+        let meta = fs::metadata(path).ok()?;
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some((meta.len(), modified))
     }
-    fs::create_dir_all(input_dir)?;
-    let dest = input_dir.join(
-        source
-            .file_name()
-            .ok_or_else(|| PipelineError::message("video path is missing a file name"))?,
-    );
-    if source.canonicalize().ok() != dest.canonicalize().ok() {
-        fs::copy(source, &dest).map_err(|err| PipelineError::from_io_path(err, source))?;
-    }
-    Ok(dest)
+    let images = stamp(&model_dir.join("images.bin"))?;
+    let points = stamp(&model_dir.join("points3D.bin")).unwrap_or((0, 0));
+    Some((images.0, images.1, points.0, points.1))
 }
 
-fn import_image_folder(source: &Path, frames_dir: &Path) -> Result<(), PipelineError> {
+fn import_image_folder(
+    source: &Path,
+    frames_dir: &Path,
+    on_progress: &mut dyn FnMut(u32, u32),
+) -> Result<(), PipelineError> {
     if !source.is_dir() {
         return Err(PipelineError::message(format!(
             "Image folder not found: {}",
@@ -777,19 +1123,28 @@ fn import_image_folder(source: &Path, frames_dir: &Path) -> Result<(), PipelineE
         )));
     }
     fs::create_dir_all(frames_dir)?;
-    let mut copied = 0;
+    let mut sources = Vec::new();
     for entry in fs::read_dir(source).map_err(|err| PipelineError::from_io_path(err, source))? {
         let src = entry?.path();
         if src.is_file() && crate::project::is_image(&src) {
-            let dest = frames_dir.join(src.file_name().unwrap());
-            crate::project::link_or_copy(&src, &dest)?;
-            copied += 1;
+            sources.push(src);
         }
     }
-    if copied == 0 {
+    sources.sort();
+    if sources.is_empty() {
         return Err(PipelineError::message(
             "No JPEG or PNG files found in the image folder.",
         ));
+    }
+    let total = sources.len() as u32;
+    let emit_every = (total / 100).max(1);
+    for (index, src) in sources.into_iter().enumerate() {
+        let dest = frames_dir.join(src.file_name().unwrap());
+        crate::project::link_or_copy(&src, &dest)?;
+        let current = index as u32 + 1;
+        if current == total || current % emit_every == 0 {
+            on_progress(current, total);
+        }
     }
     Ok(())
 }
@@ -846,6 +1201,7 @@ mod tests {
             kind,
             settings: PipelineSettings::from_preset(Preset::Fast),
             force: false,
+            restart: false,
             until: Stage::Train,
         }
     }
@@ -861,6 +1217,20 @@ mod tests {
         let outcome = run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
         assert!(outcome.ply.is_file());
         assert!(outcome.archive_id.is_some());
+        assert_eq!(
+            fs::read_dir(config.project_dir.as_ref().unwrap().join("input"))
+                .unwrap()
+                .count(),
+            0,
+            "videos are processed at the original path"
+        );
+        assert!(
+            crate::project::newest_export_ply(
+                &ProjectLayout::new(config.project_dir.as_ref().unwrap()).output_dir()
+            )
+            .is_none(),
+            "successful runs remove redundant checkpoints"
+        );
         let sidecars: Vec<_> = runner.calls.iter().map(|c| c.sidecar).collect();
         assert_eq!(sidecars[0], "ffmpeg");
         assert_eq!(
@@ -918,6 +1288,33 @@ mod tests {
     }
 
     #[test]
+    fn existing_project_rejects_a_different_source() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.mp4");
+        let second = dir.path().join("second.mp4");
+        write_video_stub(&first);
+        write_video_stub(&second);
+        let mut config = cfg(dir.path(), first, InputKind::Video);
+        config.until = Stage::Frames;
+        run_pipeline(
+            &config,
+            &mut FakeRunner::new(),
+            &CancelFlag::new(),
+            &mut CollectingEvents::new(),
+        )
+        .unwrap();
+        config.source = second;
+        let err = run_pipeline(
+            &config,
+            &mut FakeRunner::new(),
+            &CancelFlag::new(),
+            &mut CollectingEvents::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("different source"));
+    }
+
+    #[test]
     fn force_reruns_from_frames() {
         let dir = tempdir().unwrap();
         let video = dir.path().join("clip.mp4");
@@ -932,6 +1329,32 @@ mod tests {
         let mut events2 = CollectingEvents::new();
         run_pipeline(&forced, &mut runner2, &CancelFlag::new(), &mut events2).unwrap();
         assert_eq!(runner2.calls[0].sidecar, "ffmpeg");
+    }
+
+    #[test]
+    fn restart_colmap_keeps_frames() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("clip.mp4");
+        write_video_stub(&video);
+        let config = cfg(dir.path(), video, InputKind::Video);
+        let mut runner = FakeRunner::new();
+        let mut events = CollectingEvents::new();
+        run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
+        let mut restarted = config.clone();
+        restarted.restart = true;
+        restarted.until = Stage::Colmap;
+        let mut runner2 = FakeRunner::new();
+        let mut events2 = CollectingEvents::new();
+        run_pipeline(&restarted, &mut runner2, &CancelFlag::new(), &mut events2).unwrap();
+        assert_eq!(runner2.calls[0].sidecar, "colmap");
+        assert!(
+            runner2.calls.iter().all(|c| c.sidecar != "ffmpeg"),
+            "restarting cameras must not re-extract frames"
+        );
+        let layout = ProjectLayout::new(config.project_dir.as_ref().unwrap());
+        assert!(layout.is_complete(Stage::Frames));
+        assert!(layout.is_complete(Stage::Colmap));
+        assert!(!layout.is_complete(Stage::Train));
     }
 
     #[test]
@@ -1160,5 +1583,260 @@ mod tests {
             .logs
             .iter()
             .any(|line| line.contains("init.ply") || line.contains("export_1000")));
+    }
+
+    struct OverlayRunner<F> {
+        inner: FakeRunner,
+        overlay: F,
+    }
+
+    impl<F: FnMut(&CommandSpec)> SidecarRunner for OverlayRunner<F> {
+        fn run(
+            &mut self,
+            spec: &CommandSpec,
+            log: &mut dyn FnMut(&str),
+            preview: &mut dyn FnMut(&Path),
+        ) -> Result<(), PipelineError> {
+            self.inner.run(spec, log, preview)?;
+            (self.overlay)(spec);
+            Ok(())
+        }
+    }
+
+    fn spec_flag<'a>(spec: &'a CommandSpec, flag: &str) -> Option<&'a str> {
+        spec.args
+            .windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+    }
+
+    fn write_match_db(path: &Path, pair_count: u32) {
+        let _ = std::fs::remove_file(path);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE two_view_geometries (
+                 pair_id INTEGER PRIMARY KEY,
+                 rows INTEGER NOT NULL,
+                 config INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        for id in 1..=8 {
+            conn.execute(
+                "INSERT INTO images (image_id, name) VALUES (?1, ?2)",
+                (id, format!("f{id}.jpg")),
+            )
+            .unwrap();
+        }
+        for i in 1..=pair_count {
+            let pair_id = 2_147_483_647i64 * i as i64 + i as i64 + 1;
+            conn.execute(
+                "INSERT INTO two_view_geometries (pair_id, rows, config) VALUES (?1, 40, 2)",
+                [pair_id],
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_weak_colmap_db(path: &Path) {
+        write_match_db(path, 1);
+    }
+
+    fn write_strong_colmap_db(path: &Path) {
+        write_match_db(path, 7);
+    }
+
+    fn write_two_camera_images_bin(path: &Path) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        for (id, name) in [(1u32, "frame_00001.jpg"), (2u32, "frame_00002.jpg")] {
+            buf.extend_from_slice(&id.to_le_bytes());
+            for v in [1.0f64, 0.0, 0.0, 0.0] {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [0.0f64, 0.0, 0.0] {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    fn image_config(dir: &Path) -> PipelineConfig {
+        let images = dir.join("photos");
+        fs::create_dir_all(&images).unwrap();
+        for i in 0..8 {
+            fs::write(images.join(format!("{i:02}.png")), b"img").unwrap();
+        }
+        let mut config = cfg(dir, images, InputKind::Images);
+        config.until = Stage::Colmap;
+        config
+    }
+
+    #[test]
+    fn fake_colmap_db_does_not_escalate_matching() {
+        let dir = tempdir().unwrap();
+        let config = image_config(dir.path());
+        let mut runner = FakeRunner::new();
+        let mut events = CollectingEvents::new();
+        run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
+        let commands: Vec<_> = runner
+            .calls
+            .iter()
+            .filter(|c| c.sidecar == "colmap")
+            .map(|c| c.args[0].as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            ["feature_extractor", "sequential_matcher", "mapper"]
+        );
+        assert!(events
+            .logs
+            .iter()
+            .all(|line| !line.contains("expanding overlap")));
+    }
+
+    #[test]
+    fn weak_match_graph_expands_overlap() {
+        let dir = tempdir().unwrap();
+        let config = image_config(dir.path());
+        let mut runner = OverlayRunner {
+            inner: FakeRunner::new(),
+            overlay: |spec: &CommandSpec| {
+                if spec.args.first().map(String::as_str) != Some("sequential_matcher") {
+                    return;
+                }
+                if spec
+                    .args
+                    .iter()
+                    .any(|a| a == "--FeatureMatching.guided_matching")
+                {
+                    return;
+                }
+                if let Some(db) = spec_flag(spec, "--database_path") {
+                    write_weak_colmap_db(Path::new(db));
+                }
+            },
+        };
+        let mut events = CollectingEvents::new();
+        run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap();
+        let commands: Vec<_> = runner
+            .inner
+            .calls
+            .iter()
+            .filter(|c| c.sidecar == "colmap")
+            .map(|c| c.args[0].as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "feature_extractor",
+                "sequential_matcher",
+                "sequential_matcher",
+                "transitive_matcher",
+                "exhaustive_matcher",
+                "mapper"
+            ]
+        );
+        assert!(events
+            .logs
+            .iter()
+            .any(|line| line.contains("Matching was sparse, expanding overlap")));
+        assert!(events
+            .logs
+            .iter()
+            .any(|line| line.contains("transitive pairs")));
+        assert!(events
+            .progress
+            .iter()
+            .any(|(_, _, msg)| msg.contains("expanding overlap")));
+    }
+
+    #[test]
+    fn two_registered_cameras_fail_instead_of_training() {
+        let dir = tempdir().unwrap();
+        let config = image_config(dir.path());
+        let mut runner = OverlayRunner {
+            inner: FakeRunner::new(),
+            overlay: |spec: &CommandSpec| {
+                if spec.args.first().map(String::as_str) != Some("mapper") {
+                    return;
+                }
+                if let Some(out) = spec_flag(spec, "--output_path") {
+                    write_two_camera_images_bin(&Path::new(out).join("0").join("images.bin"));
+                }
+            },
+        };
+        let mut events = CollectingEvents::new();
+        let err = run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("orbit") || msg.contains("camera poses"));
+        assert_eq!(
+            runner
+                .inner
+                .calls
+                .iter()
+                .filter(|c| c.sidecar == "colmap")
+                .count(),
+            3,
+            "unreadable match db must not rematch"
+        );
+    }
+
+    #[test]
+    fn sparse_registration_retries_matching_once() {
+        let dir = tempdir().unwrap();
+        let config = image_config(dir.path());
+        let mut runner = OverlayRunner {
+            inner: FakeRunner::new(),
+            overlay: |spec: &CommandSpec| match spec.args.first().map(String::as_str) {
+                Some("sequential_matcher")
+                    if !spec
+                        .args
+                        .iter()
+                        .any(|a| a == "--FeatureMatching.guided_matching") =>
+                {
+                    if let Some(db) = spec_flag(spec, "--database_path") {
+                        write_strong_colmap_db(Path::new(db));
+                    }
+                }
+                Some("mapper") => {
+                    if let Some(out) = spec_flag(spec, "--output_path") {
+                        write_two_camera_images_bin(&Path::new(out).join("0").join("images.bin"));
+                    }
+                }
+                _ => {}
+            },
+        };
+        let mut events = CollectingEvents::new();
+        let err = run_pipeline(&config, &mut runner, &CancelFlag::new(), &mut events).unwrap_err();
+        assert!(err.to_string().contains("camera poses") || err.to_string().contains("orbit"));
+        let commands: Vec<_> = runner
+            .inner
+            .calls
+            .iter()
+            .filter(|c| c.sidecar == "colmap")
+            .map(|c| c.args[0].as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "feature_extractor",
+                "sequential_matcher",
+                "mapper",
+                "sequential_matcher",
+                "transitive_matcher",
+                "exhaustive_matcher",
+                "mapper"
+            ]
+        );
+        assert!(events
+            .logs
+            .iter()
+            .any(|line| line.contains("Too few cameras registered, rematching")));
     }
 }

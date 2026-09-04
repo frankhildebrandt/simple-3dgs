@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   cancelPipeline,
@@ -7,15 +7,26 @@ import {
   listProjectFrames,
   listProjects,
   openProject,
+  planPipeline,
+  setPreviewVisibility,
   startPipeline,
 } from "../api";
 import { parseMenuProject } from "../appMenu";
-import { expertCanRun } from "../expertActions";
+import {
+  expertCanRun,
+  needsRerunPrompt,
+  nextExpertAction,
+  rerunDecision,
+  rerunDiscardsLater,
+  stageAlreadyComplete,
+} from "../expertActions";
 import { pickProjectDir } from "../projectDialog";
 import type {
   AppConfig,
   CameraStats,
   FrameStats,
+  PipelinePlan,
+  PipelineProgressV2,
   PipelineSettings,
   ProgressEvent,
   ProjectEntry,
@@ -29,18 +40,21 @@ import type {
 import { hydrateSettings, matchingPreset, PRESET_SETTINGS } from "../types";
 import { CaptureHints } from "./CaptureHints";
 import { CaptureModePicker } from "./CaptureModePicker";
-import { CameraPreview } from "./CameraPreview";
 import { DropZone } from "./DropZone";
 import { FramePreview } from "./FramePreview";
 import { PresetPicker } from "./PresetPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import { RunProgress } from "./RunProgress";
+import { RerunDialog } from "./RerunDialog";
 import { SettingsPanel } from "./SettingsPanel";
-import { SplatViewer } from "./SplatViewer";
+
+const CameraPreview = lazy(() => import("./CameraPreview").then((module) => ({ default: module.CameraPreview })));
+const SplatViewer = lazy(() => import("./SplatViewer").then((module) => ({ default: module.SplatViewer })));
 
 type Props = {
   config: AppConfig | null;
   density: "easy" | "expert";
+  active: boolean;
   fullscreen: boolean;
   onToggleFullscreen: () => void;
 };
@@ -59,7 +73,7 @@ function stageFromProject(entry: ProjectEntry): Stage | null {
 }
 
 /** Source, settings, and live viewer for a reconstruction run. */
-export function ReconstructView({ config, density, fullscreen, onToggleFullscreen }: Props) {
+export function ReconstructView({ config, density, active, fullscreen, onToggleFullscreen }: Props) {
   const [sourcePath, setSourcePath] = useState<string | null>(null);
   const [sourceKind, setSourceKind] = useState<SourceKind>("video");
   const [settings, setSettings] = useState<PipelineSettings>(PRESET_SETTINGS.balanced);
@@ -78,11 +92,29 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
   const [framePath, setFramePath] = useState<string | null>(null);
   const [frames, setFrames] = useState<ProjectFrame[]>([]);
   const [sparse, setSparse] = useState<SparsePreview | null>(null);
+  const [rerun, setRerun] = useState<{ until: Stage } | null>(null);
+  const [runPlan, setRunPlan] = useState<PipelinePlan | null>(null);
+  const progressOrder = useRef<{ runId: string; sequence: number } | null>(null);
+
+  useEffect(() => {
+    void setPreviewVisibility(active && !document.hidden);
+    const onVisibility = () => void setPreviewVisibility(active && !document.hidden);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [active]);
 
   const onSource = useCallback((path: string, kind: SourceKind) => {
+    setProject((current) => current?.sourcePath === path ? current : null);
+    setCompleted((current) => project?.sourcePath === path ? current : null);
+    setPlyPath((current) => project?.sourcePath === path ? current : null);
+    setSparse((current) => project?.sourcePath === path ? current : null);
+    setFrames((current) => project?.sourcePath === path ? current : []);
+    setFramePath((current) => project?.sourcePath === path ? current : null);
+    setProgress(null);
+    setError(null);
     setSourcePath(path);
     setSourceKind(kind);
-  }, []);
+  }, [project?.sourcePath]);
 
   const refreshProjects = useCallback(async () => {
     if (!config) {
@@ -100,6 +132,34 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
   }, [refreshProjects]);
 
   useEffect(() => {
+    if (!sourcePath || !config?.archiveDir || status === "running") {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void planPipeline({
+        sourcePath,
+        sourceKind,
+        projectDir: project?.dir ?? null,
+        archiveDir: config.archiveDir,
+        tempProject: project?.temp ?? config.tempProject,
+        settings,
+        force: false,
+        restart: false,
+        until: "train",
+      }).then((next) => {
+        if (!cancelled) setRunPlan(next);
+      }).catch(() => {
+        if (!cancelled) setRunPlan(null);
+      });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [config, project?.dir, project?.temp, settings, sourceKind, sourcePath, status]);
+
+  useEffect(() => {
     let cancelled = false;
     const unsubs: Array<() => void> = [];
     const bind = async <T,>(event: string, handler: (payload: T) => void) => {
@@ -111,10 +171,15 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
       unsubs.push(off);
     };
     void (async () => {
-      await bind<ProgressEvent>("pipeline-progress", setProgress);
-      await bind<TrainStats>("pipeline-train-stats", setTrain);
-      await bind<FrameStats>("pipeline-frame-stats", setFrameStats);
-      await bind<CameraStats>("pipeline-camera-stats", setCameraStats);
+      await bind<PipelineProgressV2>("pipeline-progress-v2", (next) => {
+        const previous = progressOrder.current;
+        if (previous?.runId === next.runId && next.sequence <= previous.sequence) return;
+        progressOrder.current = { runId: next.runId, sequence: next.sequence };
+        setProgress({ ...next, percent: next.stagePercent });
+        if (next.frames) setFrameStats(next.frames);
+        if (next.cameras) setCameraStats(next.cameras);
+        if (next.train) setTrain(next.train);
+      });
       await bind<string>("pipeline-preview", setPlyPath);
       await bind<string>("pipeline-frame-preview", (path) => {
         setFramePath(path);
@@ -244,7 +309,7 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
     return created;
   }
 
-  async function runUntil(until: Stage) {
+  async function runUntil(until: Stage, restart = false) {
     if (!sourcePath || !config?.archiveDir) {
       return;
     }
@@ -266,11 +331,17 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
     setFrameStats(null);
     setCameraStats(null);
     setProgress(null);
-    if (until === "frames") {
+    const wipeAll = density === "expert" && force;
+    if (wipeAll || until === "frames") {
       setPlyPath(null);
       setSparse(null);
       setFrames([]);
       setFramePath(null);
+    } else if (restart && until === "colmap") {
+      setPlyPath(null);
+      setSparse(null);
+    } else if (restart && until === "train") {
+      setPlyPath(null);
     }
     try {
       const result = await startPipeline({
@@ -280,7 +351,8 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
         archiveDir: config.archiveDir,
         tempProject: active.temp,
         settings,
-        force: density === "expert" && force,
+        force: wipeAll,
+        restart,
         until,
       });
       setCompleted(result.completedStage);
@@ -314,6 +386,17 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
         }
       }
       await refreshProjects();
+      setRunPlan(await planPipeline({
+        sourcePath,
+        sourceKind,
+        projectDir: result.projectDir,
+        archiveDir: config.archiveDir,
+        tempProject: active.temp,
+        settings,
+        force: false,
+        restart: false,
+        until: "train",
+      }).catch(() => null));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
@@ -321,11 +404,37 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
     }
   }
 
+  /** Ask keep-or-redo when this expert stage already ran or just failed. */
+  function requestRun(until: Stage) {
+    const skipPrompt = density !== "expert" || force;
+    if (!skipPrompt && needsRerunPrompt(until, completed, status)) {
+      setRerun({ until });
+      return;
+    }
+    void runUntil(until);
+  }
+
+  /** Continue keeps finished outputs; restart wipes this step and later ones. */
+  function confirmRerun(choice: "continue" | "restart") {
+    if (!rerun) {
+      return;
+    }
+    const until = rerun.until;
+    const alreadyComplete = stageAlreadyComplete(until, completed);
+    setRerun(null);
+    const decision = rerunDecision(choice, alreadyComplete);
+    if (decision.kind === "keep") {
+      return;
+    }
+    void runUntil(until, decision.restart);
+  }
+
   const running = status === "running";
   runningRef.current = running;
   const hasProject = Boolean(project || (sourcePath && config));
   const canEasy =
     Boolean(sourcePath && config?.archiveDir) && !running;
+  const primaryExpert = nextExpertAction(completed);
 
   let main: "splat" | "frames" | "cameras" = "splat";
   if (plyPath) {
@@ -396,25 +505,27 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
           <div className="inspector-actions">
             <button
               type="button"
-              className="primary"
+              className={primaryExpert === "frames" ? "primary" : undefined}
               disabled={!expertCanRun("frames", completed, running, Boolean(sourcePath), hasProject)}
-              onClick={() => void runUntil("frames")}
+              onClick={() => requestRun("frames")}
             >
-              Extract frames
+              {stageAlreadyComplete("frames", completed) ? "Frames ready" : "Extract frames"}
             </button>
             <button
               type="button"
+              className={primaryExpert === "colmap" ? "primary" : undefined}
               disabled={!expertCanRun("colmap", completed, running, Boolean(sourcePath), hasProject)}
-              onClick={() => void runUntil("colmap")}
+              onClick={() => requestRun("colmap")}
             >
-              Estimate cameras
+              {stageAlreadyComplete("colmap", completed) ? "Cameras ready" : "Estimate cameras"}
             </button>
             <button
               type="button"
+              className={primaryExpert === "train" ? "primary" : undefined}
               disabled={!expertCanRun("train", completed, running, Boolean(sourcePath), hasProject)}
-              onClick={() => void runUntil("train")}
+              onClick={() => requestRun("train")}
             >
-              Train splat
+              {stageAlreadyComplete("train", completed) ? "Restart splat…" : "Train splat"}
             </button>
             <button type="button" disabled={!running} onClick={() => void cancelPipeline()}>
               Cancel
@@ -422,6 +533,14 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
           </div>
         ) : (
           <div className="inspector-actions">
+            {runPlan ? (
+              <p
+                className="run-plan"
+                title={runPlan.stages.map((item) => `${item.stage}: ${item.reason}`).join("\n")}
+              >
+                {runPlan.stages.map((item) => `${item.stage === "colmap" ? "Cameras" : item.stage === "train" ? "Splat" : "Frames"}: ${item.action === "reuse" ? "reuse" : "run"}`).join(" · ")}
+              </p>
+            ) : null}
             <button type="button" className="primary" disabled={!canEasy} onClick={() => void runUntil("train")}>
               Reconstruct
             </button>
@@ -433,18 +552,28 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
       </aside>
       <main className="main">
         {main === "cameras" && sparse ? (
-          <CameraPreview preview={sparse} />
+          <Suspense fallback={<div className="viewer stage-preview"><p className="viewer-hint">Loading camera preview…</p></div>}>
+            <CameraPreview preview={sparse} active={active} />
+          </Suspense>
         ) : main === "frames" ? (
           <FramePreview currentPath={framePath} frames={frames} onSelect={setFramePath} />
+        ) : plyPath ? (
+          <Suspense fallback={<div className="viewer"><p className="viewer-hint">Loading 3D viewer…</p></div>}>
+            <SplatViewer
+              plyPath={plyPath}
+              captureMode={settings.captureMode}
+              viewer={settings.viewer}
+              live={running}
+              active={active}
+              fullscreen={fullscreen}
+              onToggleFullscreen={onToggleFullscreen}
+            />
+          </Suspense>
         ) : (
-          <SplatViewer
-            plyPath={plyPath}
-            captureMode={settings.captureMode}
-            viewer={settings.viewer}
-            live={running}
-            fullscreen={fullscreen}
-            onToggleFullscreen={onToggleFullscreen}
-          />
+          <div className="viewer viewer-empty">
+            <p>Choose a source and reconstruct it.</p>
+            <small>The 3D renderer starts only when a preview is available.</small>
+          </div>
         )}
         <RunProgress
           status={status}
@@ -453,9 +582,20 @@ export function ReconstructView({ config, density, fullscreen, onToggleFullscree
           cameras={cameraStats}
           train={train}
           error={error}
+          projectDir={project?.dir}
+          plan={runPlan}
         />
       </main>
       <CaptureHints mode={settings.captureMode} open={hintsOpen} onClose={() => setHintsOpen(false)} />
+      {rerun ? (
+        <RerunDialog
+          stage={rerun.until}
+          alreadyComplete={stageAlreadyComplete(rerun.until, completed)}
+          discardsLater={rerunDiscardsLater(rerun.until, completed)}
+          onChoose={confirmRerun}
+          onCancel={() => setRerun(null)}
+        />
+      ) : null}
     </div>
   );
 }
